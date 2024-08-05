@@ -1,7 +1,5 @@
-from enum import Enum
 from pathlib import Path
-from pprint import pprint
-
+from enum import Enum
 from dataclasses import dataclass, field
 from typing import TextIO, Optional
 
@@ -166,7 +164,7 @@ def unescape(filename: str) -> str:
             raise Exception("Missing closing quote in filename: " + filename)
 
         filename = filename[1:-1]
-        return filename.replace('\\n', '\n').replace('\\"', '"').replace("\\'", "'").replace('\\\\', '\\')
+        filename = filename.replace('\\n', '\n').replace('\\"', '"').replace("\\'", "'").replace('\\\\', '\\')
 
     return filename
 

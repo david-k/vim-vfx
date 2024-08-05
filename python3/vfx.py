@@ -1,5 +1,6 @@
 import vim
 import io
+import re
 from pathlib import Path
 
 from dataclasses import dataclass, field
@@ -71,7 +72,7 @@ def escape_for_vim_expr(text: str):
     return "'" + text.replace("'", "''") + "'"
 
 def escape_for_vim_command(text: str):
-    return text.replace("\n", "\\\n")
+    return re.sub(r'(\n| |\t|\r|\\)', r'\\\1', text)
 
 
 def vim_set_buffer_contents(lines: list[str]):
