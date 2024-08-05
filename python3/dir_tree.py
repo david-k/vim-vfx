@@ -131,13 +131,45 @@ def print_tree(out: TextIO, tree: DirTree):
 
 def print_entries(out: TextIO, entries: list[DirEntry], indent: int):
     for entry in entries:
-        out.write(indent * "\t" + entry.name)
+        out.write(indent * "\t" + escape_if_needed(entry.name))
         if entry.kind == EntryKind.DIRECTORY:
             out.write("/")
         out.write("\n")
 
         if len(entry.children):
             print_entries(out, entry.children, indent + 1)
+
+
+
+def escape_if_needed(filename: str) -> str:
+    if needs_escaping(filename):
+        return escape_filename(filename)
+
+    return filename
+
+
+def needs_escaping(filename: str) -> bool:
+    if filename.find("\n") != -1:
+        return True
+
+    return filename[0].isspace() or filename[-1].isspace()
+
+
+def escape_filename(filename: str) -> str:
+    escaped = filename.replace('\\', '\\\\').replace("'", "\\'").replace('"', '\\"').replace('\n', '\\n')
+    return "'" + escaped + "'"
+
+
+def unescape(filename: str) -> str:
+    if filename[0] == "'":
+        if filename[-1] != "'":
+            raise Exception("Missing closing quote in filename: " + filename)
+
+        filename = filename[1:-1]
+        return filename.replace('\\n', '\n').replace('\\"', '"').replace("\\'", "'").replace('\\\\', '\\')
+
+    return filename
+
 
 
 #===============================================================================

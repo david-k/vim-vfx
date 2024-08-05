@@ -67,15 +67,17 @@ def restore_alternate_buf(s: Session):
 
 # Vim helpers
 #-----------------------------------------------------------
-def escape_for_vim(text: str):
+def escape_for_vim_expr(text: str):
     return "'" + text.replace("'", "''") + "'"
+
+def escape_for_vim_command(text: str):
+    return text.replace("\n", "\\\n")
 
 
 def vim_set_buffer_contents(lines: list[str]):
     line_no = vim.eval('line(".")')
-    vim.command('normal gg"_dG') # Delete buffer contents using the blackhole register _
-    vim.current.buffer.append(lines)
-    vim.command('normal gg"_dd')
+    buf = vim.current.buffer
+    buf[:] = lines
     vim.command(f'normal {line_no}G')
 
 
@@ -88,7 +90,7 @@ def vim_get_line_no() -> int:
 
 
 def is_buf_name_available(buf_name: str) -> bool:
-    return int(vim.eval(f'bufexists( {escape_for_vim(buf_name)} )')) == 0
+    return int(vim.eval(f'bufexists( {escape_for_vim_expr(buf_name)} )')) == 0
 
 
 def make_buf_name(path: str) -> str:
@@ -114,7 +116,7 @@ def rename_buffer(new_name: str):
 
     alt_buf = vim.eval('bufnr("#")')
 
-    vim.command('file ' + new_name)
+    vim.command('file ' + escape_for_vim_command(new_name))
     prev_name_buf = vim.eval('bufnr("#")')
     vim.command('bwipeout ' + prev_name_buf)
 
@@ -128,10 +130,9 @@ def is_expanded(line_no: int) -> bool:
 
 
 def get_path_at(line_no: int) -> Path:
-    parts = [vim_get_line(line_no).strip()]
+    parts = [get_filename_at_line(line_no)]
     while line_no := go_to_parent(line_no):
-        line = vim_get_line(line_no)
-        parts.append(line.strip())
+        parts.append(get_filename_at_line(line_no))
 
     head, *tail = reversed(parts)
     return Path(head).joinpath(*tail)
@@ -156,6 +157,11 @@ def get_indent(line_no: int) -> int:
             break
 
     return indent
+
+
+def get_filename_at_line(line_no: int) -> str:
+    filename = vim_get_line(line_no).strip()
+    return dir_tree.unescape(filename)
 
 
 # Externally called functions
@@ -188,7 +194,7 @@ def init():
     # Initially, I was using `bufadd()` instead of `:edit` but this leaves the
     # "[No Name]" buffer behind. `:edit` on the other hand automatically closes
     # that buffer if it is empty.
-    vim.command("edit " + buf_name)
+    vim.command("edit " + escape_for_vim_command(buf_name))
     vim.command('setlocal bufhidden=wipe')
     vim.command('setlocal buftype=nofile')
     vim.command('setlocal noswapfile')
@@ -242,7 +248,7 @@ def open_entry():
         rename_buffer(new_name)
     else:
         on_exit(s)
-        vim.command("keepalt edit " + str(filepath))
+        vim.command("keepalt edit " + escape_for_vim_command(str(filepath)))
 
 def toggle_expand():
     s = get_session()
