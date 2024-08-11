@@ -28,6 +28,7 @@ EOF
 	setl textwidth=0
 	setl wrapmargin=0
 	setl indentexpr=py3eval('vfx.get_indent_for_vim('.v:lnum.')')
+	setl cursorline
 endfunction
 
 
@@ -40,8 +41,8 @@ endfunction
 autocmd FileType vfx syntax match VfxLeadingSpace "^[ \t]*" nextgroup=VfxID,VfxAdded
 autocmd FileType vfx syntax region VfxDetails start="^\[" end="\][ \t]*" nextgroup=VfxID
 
-autocmd FileType vfx syntax match VfxID "#[0-9]\+:[0-9]\+" contained conceal cchar=#
-autocmd FileType vfx syntax match VfxID "#[0-9]\+:[0-9]\+x" contained conceal cchar=# nextgroup=VfxExecutable
+autocmd FileType vfx syntax match VfxID "|[0-9]\+:[0-9]\+" contained conceal cchar=|
+autocmd FileType vfx syntax match VfxID "|[0-9]\+:[0-9]\+x" contained conceal cchar=| nextgroup=VfxExecutable
 autocmd FileType vfx syntax match VfxID "+[0-9]\+:[0-9]\+" contained conceal cchar=+ nextgroup=VfxDirectory
 autocmd FileType vfx syntax match VfxID "-[0-9]\+:[0-9]\+" contained conceal cchar=- nextgroup=VfxDirectory
 
@@ -59,7 +60,7 @@ autocmd FileType vfx syntax match VfxBrokenLink " ->! .\+"
 autocmd FileType vfx syntax match VfxUnknownLink " ->?"
 
 " Matches new entries without a leading ID
-autocmd FileType vfx syntax match VfxAdded "[^\[#+\- \t].*" contained
+autocmd FileType vfx syntax match VfxAdded "[^\[|+\- \t].*" contained
 
 
 autocmd FileType vfx highlight def link VfxDirectory Directory

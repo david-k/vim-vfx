@@ -2,6 +2,7 @@ import os
 import pwd
 import grp
 import stat
+from datetime import datetime
 from pathlib import Path
 from enum import Enum
 from dataclasses import dataclass, field
@@ -29,6 +30,8 @@ class NodeDetails:
     user: str
     group: str
     mode: str
+    size: str
+    mtime: str
 
 
 @dataclass
@@ -261,6 +264,8 @@ class DirView:
                 user = pwd.getpwuid(stat_itself.st_uid).pw_name,
                 group = grp.getgrgid(stat_itself.st_gid).gr_name,
                 mode = stat.filemode(stat_itself.st_mode),
+                size = size_to_human(stat_target.st_size),
+                mtime = datetime.fromtimestamp(stat_itself.st_mtime).isoformat(" ", "minutes"),
             )
 
         return self.tree.make_node(
@@ -299,3 +304,15 @@ def entry_is_dir(entry: os.DirEntry) -> bool:
         pass
 
     return False
+
+
+def size_to_human(size: int) -> str:
+    cur_size = float(size)
+    units = ["", "K", "M", "G", "T"]
+    for i in range(len(units)):
+        if cur_size < 1024:
+            break
+
+        cur_size /= 1024
+
+    return f"{cur_size:.1f}{units[i]}"

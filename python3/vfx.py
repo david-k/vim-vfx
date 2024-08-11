@@ -208,6 +208,9 @@ def get_indent(line: str, indent_offset: int) -> int:
 
         idx += 1
 
+    if idx < len(line) and line[idx] not in ["|", "+", "-"]:
+        indent -= 2
+
     return max(indent, 0) // INDENT_WIDTH
 
 
@@ -286,13 +289,13 @@ def parse_identifier(parser: ParseState) -> str:
     return parser.text[start:parser.pos]
 
 
-def parse_until_space(parser: ParseState) -> str:
+def parse_until(parser: ParseState, chars: list[str]) -> str:
     start = parser.pos
-    while not parser.done() and unwrap(parser.char()) != " ":
+    while not parser.done() and unwrap(parser.char()) not in chars:
         parser.advance()
 
     if parser.pos == start:
-        raise Exception("Expected identifier: " + parser.text[start:])
+        raise Exception("Expected something: " + parser.text[start:])
 
     return parser.text[start:parser.pos]
 
@@ -394,7 +397,7 @@ def try_parse_details(parser: ParseState) -> Optional[NodeDetails]:
     if not try_consume(parser, "["):
         return None
 
-    mode = parse_until_space(parser).strip()
+    mode = parse_until(parser, [" "]).strip()
 
     skip_whitespace(parser)
     user = parse_identifier(parser).strip()
@@ -403,17 +406,25 @@ def try_parse_details(parser: ParseState) -> Optional[NodeDetails]:
     group = parse_identifier(parser).strip()
 
     skip_whitespace(parser)
+    size = parse_until(parser, [" "]).strip()
+
+    skip_whitespace(parser)
+    mtime = parse_until(parser, ["]"]).strip()
+
+    skip_whitespace(parser)
     consume(parser, "]")
 
     return NodeDetails(
         user = user,
         group = group,
         mode = mode,
+        size = size,
+        mtime = mtime,
     )
 
 
 def try_parse_node_state(parser: ParseState) -> Optional[NodeState]:
-    if try_consume(parser, "#"):
+    if try_consume(parser, "|"):
         return NodeState.FILE
 
     if try_consume(parser, "+"):
@@ -476,7 +487,7 @@ def try_parse_filename(parser: ParseState) -> Optional[tuple[EntryKind, str]]:
 
 # DirView: printing
 #-----------------------------------------------------------
-NUM_DETAIL_COLUMNS = 3
+NUM_DETAIL_COLUMNS = 5
 
 def print_entries(entries: list[DirNode], max_id_width: int = 6):
     column_widths = [0] * (NUM_DETAIL_COLUMNS + 1)
@@ -516,12 +527,14 @@ def write_entries(out: TextIO, entries: list[DirNode], column_widths: list[int],
             c1_width = column_widths[0]
             c2_width = column_widths[1]
             c3_width = column_widths[2]
+            c4_width = column_widths[3]
+            c5_width = column_widths[4]
             # ATTENTION: This must be kept in sync with the computation of `details_width` in `write_tree()`
-            out.write(f"[{d.mode:<{c1_width}} {d.user:<{c2_width}} {d.group:<{c3_width}}] ")
+            out.write(f"[{d.mode:<{c1_width}} {d.user:<{c2_width}} {d.group:<{c3_width}} {d.size:>{c4_width}} {d.mtime:<{c5_width}}] ")
 
         out.write(indent * INDENT_WIDTH * " ")
 
-        node_state = "#"
+        node_state = "|"
         if entry.is_dir():
             if entry.is_expanded:
                 node_state = "-"
@@ -564,6 +577,7 @@ def compute_column_widths(nodes: list[DirNode], widths: list[int]):
         widths[0] = max(widths[0], len(node.details.mode))
         widths[1] = max(widths[1], len(node.details.user))
         widths[2] = max(widths[2], len(node.details.group))
+        widths[3] = max(widths[3], len(node.details.size))
 
         if node.is_dir():
             compute_column_widths(node.children, widths)
@@ -992,7 +1006,7 @@ def get_indent_for_vim(line_no: int) -> int:
 
         idx += 1
 
-    if idx < len(prev_line) and prev_line[idx] in ["#", "+", "-"]:
+    if idx < len(prev_line) and prev_line[idx] in ["|", "+", "-"]:
         indent += 2
 
     return indent
