@@ -9,11 +9,11 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+# Directory tree
 #===============================================================================
-UniqueEntryID = tuple[int, int] # Generation ID, Entry ID
+NodeID = tuple[int, int] # Generation ID, Entry ID
 
-
-class EntryKind(Enum):
+class NodeKind(Enum):
     DIRECTORY = 1
     FILE = 2
 
@@ -36,9 +36,9 @@ class NodeDetails:
 
 @dataclass
 class DirNode:
-    id: UniqueEntryID
+    id: NodeID
     name: str # For all non-root nodes, the name does not contain any path separators
-    kind: EntryKind
+    kind: NodeKind
     parent: Optional["DirNode"] = None
 
     link_status: LinkStatus = LinkStatus.NO_LINK
@@ -54,10 +54,10 @@ class DirNode:
     details: Optional[NodeDetails] = None
 
     def is_dir(self) -> bool:
-        return self.kind == EntryKind.DIRECTORY
+        return self.kind == NodeKind.DIRECTORY
 
     def is_file(self) -> bool:
-        return self.kind == EntryKind.FILE
+        return self.kind == NodeKind.FILE
 
     def is_root(self) -> bool:
         return bool(self.parent)
@@ -78,7 +78,7 @@ class DirTree:
         self.root = DirNode(
             id = (gen_id, self._next_id()),
             name = str(root_dir),
-            kind = EntryKind.DIRECTORY
+            kind = NodeKind.DIRECTORY
         )
 
     def root_dir(self) -> Path:
@@ -88,12 +88,12 @@ class DirTree:
         self.root = DirNode(
             id = (self.root.id[0], self._next_id()),
             name = str(new_root_dir),
-            kind = EntryKind.DIRECTORY
+            kind = NodeKind.DIRECTORY
         )
 
     def make_node(self,
         name: str,
-        kind: EntryKind,
+        kind: NodeKind,
         parent: DirNode,
         is_executable: bool = False,
         link_target: Optional[Path] = None,
@@ -122,11 +122,11 @@ class DirTree:
     def lookup(self, p: Path) -> Optional[DirNode]:
         return self._lookup(self.root, list(p.parts))
 
-    def lookup_or_create(self, p: Path, kind: EntryKind) -> DirNode:
+    def lookup_or_create(self, p: Path, kind: NodeKind) -> DirNode:
         node = self._lookup(self.root, list(p.parts), kind); assert node is not None
         return node
 
-    def _lookup(self, parent: DirNode, path_parts: list[str], create_kind: Optional[EntryKind] = None) -> Optional[DirNode]:
+    def _lookup(self, parent: DirNode, path_parts: list[str], create_kind: Optional[NodeKind] = None) -> Optional[DirNode]:
         if not parent.is_dir():
             raise Exception("Node is not a directory")
 
@@ -142,7 +142,7 @@ class DirTree:
             for (idx, name) in enumerate(path_parts):
                 parent = self.make_node(
                     name,
-                    kind = create_kind if idx == len(path_parts) - 1 else EntryKind.DIRECTORY,
+                    kind = create_kind if idx == len(path_parts) - 1 else NodeKind.DIRECTORY,
                     parent = parent
                 )
 
@@ -156,6 +156,8 @@ class DirTree:
          return self.last_entry_id
 
 
+# Directory view
+#===============================================================================
 class DirView:
     tree: DirTree
     expanded_dirs: set[Path]
@@ -270,7 +272,7 @@ class DirView:
 
         return self.tree.make_node(
             name = entry.name,
-            kind = EntryKind.DIRECTORY if entry_is_dir(entry) else EntryKind.FILE,
+            kind = NodeKind.DIRECTORY if entry_is_dir(entry) else NodeKind.FILE,
             parent = parent,
             is_executable = is_executable,
             link_target = link_target,
