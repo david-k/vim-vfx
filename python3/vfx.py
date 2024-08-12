@@ -5,34 +5,33 @@ import subprocess
 from pathlib import Path
 
 from enum import Enum
-from dataclasses import dataclass, field
-from typing import NewType, Optional, Callable, TextIO, TypeVar, Generic
+from dataclasses import (
+    dataclass,
+    field
+)
+from typing import (
+    NewType,
+    Optional,
+    Callable,
+    TextIO,
+    TypeVar,
+    Generic
+)
 
-from dir_tree import DirTree, DirView, DirNode, NodeKind, LinkStatus, NodeID, NodeDetails
-
-from pprint import pprint
-
-T = TypeVar("T")
-
-
-# Config
-#===============================================================================
-# Number of spaces used for indentation. TODO Read from 'softtabstop' or 'shiftwidth'?
-INDENT_WIDTH = 4
-
-class NodeState(Enum):
-    FILE = 1
-    DIR_OPEN = 2
-    DIR_CLOSED = 3
-
-NODE_STATE_SYMBOLS = {
-    NodeState.FILE:       "|",
-    NodeState.DIR_OPEN:   "-",
-    NodeState.DIR_CLOSED: "+",
-}
-
-# All NODE_STATE_SYMBOLS must have the same length
-NODE_STATE_SYMBOL_WIDTH = len(NODE_STATE_SYMBOLS[NodeState.FILE])
+from config import Config, default_config
+from dir_tree import (
+    DirTree,
+    DirView,
+    DirNode,
+    NodeKind,
+    LinkStatus,
+    NodeID,
+)
+from dir_parser import (
+    parse_line,
+    parse_tree,
+    compute_indent,
+)
 
 
 # Global state
@@ -57,7 +56,8 @@ class GlobalTreeState:
     cursor_column: int = 1
 
 
-GLOBAL_STATE = GlobalTreeState()
+CONFIG = default_config()
+GLOBAL_TREE_STATE = GlobalTreeState()
 LAST_GEN_ID = 0
 SESSIONS: dict[int, Session] = {}
 
@@ -78,14 +78,14 @@ def get_session() -> Optional[Session]:
 
 # Should be called right before the buffer is closed
 def on_exit(s: Session):
-    global GLOBAL_STATE
+    global GLOBAL_TREE_STATE
 
-    GLOBAL_STATE.root_dir = s.view.root_dir()
-    GLOBAL_STATE.expanded_dirs = s.view.expanded_dirs
-    GLOBAL_STATE.show_dotfiles = s.view.show_dotfiles
-    GLOBAL_STATE.show_details = s.view.show_details
-    GLOBAL_STATE.cursor_line = vim_get_line_no()
-    GLOBAL_STATE.cursor_column = vim_get_column_no()
+    GLOBAL_TREE_STATE.root_dir = s.view.root_dir()
+    GLOBAL_TREE_STATE.expanded_dirs = s.view.expanded_dirs
+    GLOBAL_TREE_STATE.show_dotfiles = s.view.show_dotfiles
+    GLOBAL_TREE_STATE.show_details = s.view.show_details
+    GLOBAL_TREE_STATE.cursor_line = vim_get_line_no()
+    GLOBAL_TREE_STATE.cursor_column = vim_get_column_no()
 
     del SESSIONS[s.buf_no]
 
@@ -136,19 +136,27 @@ def vim_set_buffer_contents(lines: list[str]):
     column = vim_get_column_no()
     buf = vim.current.buffer
     buf[:] = lines
-    vim.command(f'normal {line_no}G')
-    vim.command(f'normal 0{column-1}l')
+    vim_set_line_no(line_no)
+    vim_set_column_no(column)
 
 
 def vim_get_line(line_no) -> str:
     return vim.eval(f'getline({line_no})')
 
-
 def vim_get_line_no() -> int:
     return int(vim.eval('line(".")'))
 
+def vim_set_line_no(line_no: int):
+    vim.command(f'normal {line_no}G')
+
 def vim_get_column_no() -> int:
     return int(vim.eval('col(".")'))
+
+def vim_set_column_no(col: int):
+    if col > 1:
+        vim.command(f'normal 0{col-1}l')
+    else:
+        vim.command(f'normal 0')
 
 
 def is_buf_name_available(buf_name: str) -> bool:
@@ -214,375 +222,13 @@ def get_indent_at(line_no: int, indent_offset: int) -> int:
     if not line:
         return 0
 
-    _, segments = parse_line(line)
-    return compute_indent(segments, indent_offset)
+    _, segments = parse_line(CONFIG, line)
+    return compute_indent(CONFIG, segments, indent_offset)
 
 
 def get_name_at(line: str) -> str:
-    node, _ = parse_line(line)
+    node, _ = parse_line(CONFIG, line)
     return node.name
-
-
-# Parser
-#-----------------------------------------------------------
-@dataclass
-class ParseState:
-    text: str
-    pos: int = 0
-
-    # TODO Reduce copying slices
-
-    def char(self) -> Optional[str]:
-        return None if self.done() else self.text[self.pos]
-
-    def check_char(self, f: Callable[[str], bool]) -> bool:
-        return False if self.done() else f(self.text[self.pos])
-
-    def tail(self) -> str:
-        return self.text[self.pos:]
-
-    def done(self) -> bool:
-        return self.pos == len(self.text)
-
-    def advance(self, offset: int = 1):
-        self.pos = min(self.pos + offset, len(self.text))
-
-
-def skip_whitespace(parser: ParseState):
-    while parser.check_char(lambda ch: ch in [" ", "\t", "\r"]):
-        parser.advance()
-
-
-def try_parse_int(parser: ParseState) -> Optional[int]:
-    start = parser.pos
-    while not parser.done() and is_digit(unwrap(parser.char())):
-        parser.advance()
-
-    if parser.pos == start:
-        return None
-
-    return int(parser.text[start:parser.pos])
-
-
-def parse_int(parser: ParseState, error_context: str) -> int:
-    val = try_parse_int(parser)
-    if val is None:
-        raise Exception("Error: expected " + error_context)
-
-    return val
-
-
-def try_consume(parser: ParseState, s: str) -> bool:
-    if parser.tail().startswith(s):
-        parser.advance(len(s))
-        return True
-
-    return False
-
-
-def consume(parser: ParseState, s: str):
-    if not parser.tail().startswith(s):
-        raise Exception("Parsing failed, expected: " + s)
-
-    parser.advance(len(s))
-
-
-def parse_identifier(parser: ParseState) -> str:
-    start = parser.pos
-    while not parser.done() and unwrap(parser.char()).isalnum():
-        parser.advance()
-
-    if parser.pos == start:
-        raise Exception("Expected identifier: " + parser.text[start:])
-
-    return parser.text[start:parser.pos]
-
-
-def parse_until(parser: ParseState, chars: list[str]) -> str:
-    start = parser.pos
-    while not parser.done() and unwrap(parser.char()) not in chars:
-        parser.advance()
-
-    if parser.pos == start:
-        raise Exception("Expected something: " + parser.text[start:])
-
-    return parser.text[start:parser.pos]
-
-
-def is_digit(s: str) -> bool:
-    for c in s:
-        n = ord(c)
-        if n < 48 or n > 57:
-            return False
-
-    return True
-
-
-def unwrap(v: Optional[T]) -> T:
-    if v is None:
-        raise Exception("unwrapping None")
-
-    return v
-
-
-# Line parsing
-#-----------------------------------------------------------
-@dataclass
-class Span:
-    start: int
-    end: int # exclusive
-
-def empty_span():
-    return Span(0, 0)
-
-@dataclass
-class LineSegments:
-    details: Optional[Span] = None
-    node_state: Optional[Span] = None
-    name: Span = field(default_factory=empty_span)
-
-
-@dataclass
-class DecoratedNodeID:
-    id: NodeID
-    is_executable: bool
-
-
-@dataclass
-class NewNode:
-    name: str
-    kind: NodeKind
-
-
-def compute_indent(segments: LineSegments, indent_offset: int) -> int:
-    first_significant_char = 0
-    if segments.node_state is not None:
-        first_significant_char = segments.node_state.start
-    else:
-        # Even if there is no node state we calculate the indentation as if there was
-        first_significant_char = segments.name.start - NODE_STATE_SYMBOL_WIDTH - 1
-
-    indent = (first_significant_char - indent_offset) // INDENT_WIDTH
-    return indent
-
-
-def parse_tree(root_dir: Path, lines: list[str], indent_offset: int) -> tuple[DirTree, dict[NodeID, DirNode]]:
-    tree = DirTree(-1, root_dir)
-    nodes_by_id: dict[NodeID, DirNode] = {}
-
-    parent_stack: list[DirNode] = [tree.root]
-    prev_indent = 0
-    prev_node: Optional[DirNode] = None
-    for line in lines:
-        if not line.strip():
-            continue
-
-        parsed_node, segments = parse_line(line)
-        indent = compute_indent(segments, indent_offset)
-
-        # Update parent stack if indention has changed
-        if indent < prev_indent:
-            for i in range(prev_indent - indent):
-                parent_stack.pop()
-            prev_indent = indent
-        elif indent > prev_indent:
-            if not prev_node:
-                raise Exception("First line cannot be indented")
-            if not prev_node.is_dir():
-                raise Exception("Parent is not a directory (indent = " + str(indent))
-            parent_stack.append(prev_node)
-            prev_indent += 1
-
-
-        parent = parent_stack[-1]
-        match parsed_node:
-            case DirNode() as node:
-                if node.id in nodes_by_id:
-                    raise Exception("Duplicate node id: " + str(node.id))
-
-                node.parent = parent
-                parent.children.append(node)
-
-                nodes_by_id[node.id] = node
-                prev_node = node
-
-            case NewNode() as new_node:
-                node = tree.lookup_or_create(parent.filepath() / new_node.name, new_node.kind)
-                nodes_by_id[node.id] = node
-                prev_node = node
-
-
-    return tree, nodes_by_id
-
-
-# A single line consists of the following fields:
-#
-# 1. Node details: "[drwxr-xr-x user group size mtime]"
-# 2. Node state:   "|" (file node) or
-#                  "+" (collapsed directory node) or
-#                  "-" (expanded directory node)
-# 3. Node ID:      "X:Y_" where X denotes the generation ID, Y the actual node ID, and _ is an optional flag
-# 4. Node name:    "filename"
-# 5. Link target   " -> link_target_name"
-#
-# During parsing, we distinguish between two kind of nodes:
-# - An *existing* node is a node that has an ID and exists in the DirTree.
-# - A *new* node does not exist in the DirTree
-#
-# For existing nodes, we require that fields (2) - (4) can be parsed
-# successfully (fields (1) and (5) are optional). For new nodes, we require
-# that *only* (4), i.e. the node name, is present.
-def parse_line(line: str) -> tuple[DirNode|NewNode, LineSegments]:
-    parser = ParseState(line)
-    segments = LineSegments()
-
-    details = try_parse_details(parser, segments)
-    node_state = try_parse_node_state(parser, segments)
-
-    # If neither the node details or the node state are present we consider
-    # this to be a new node
-    is_new_node = details is None and node_state is None
-    if is_new_node:
-        node_kind, node_name = parse_node_name(parser, segments)
-
-        # Don't allow any junk at the end
-        junk_start = parser.pos
-        skip_whitespace(parser)
-        if not parser.done():
-            raise Exception("Unexpected chars after filename: " + parser.text[junk_start:])
-
-        return NewNode(name = node_name, kind = node_kind), segments
-
-
-    # If we get here we are parsing an existing node
-    node_id = parse_node_id(parser)
-    node_kind, node_name = parse_node_name(parser, segments)
-    if (node_kind == NodeKind.FILE) != (node_state == NodeState.FILE):
-        raise Exception("Folder states only applicable to folders")
-
-    link_status, link_target = parse_link_status(parser)
-    node = DirNode(
-        id = node_id.id,
-        name = node_name,
-        kind = node_kind,
-        is_executable = node_id.is_executable,
-        link_target = link_target,
-        is_expanded = node_state == NodeState.DIR_OPEN,
-        link_status = link_status,
-        details = details,
-    )
-
-    return node, segments
-
-
-def try_parse_details(parser: ParseState, segments: LineSegments) -> Optional[NodeDetails]:
-    if not try_consume(parser, "["):
-        return None
-
-    start_pos = parser.pos
-    mode = parse_until(parser, [" "]).strip()
-
-    skip_whitespace(parser)
-    user = parse_identifier(parser).strip()
-
-    skip_whitespace(parser)
-    group = parse_identifier(parser).strip()
-
-    skip_whitespace(parser)
-    size = parse_until(parser, [" "]).strip()
-
-    skip_whitespace(parser)
-    mtime = parse_until(parser, ["]"]).strip()
-
-    skip_whitespace(parser)
-    consume(parser, "]")
-
-    segments.details = Span(start_pos, parser.pos)
-
-    return NodeDetails(
-        user = user,
-        group = group,
-        mode = mode,
-        size = size,
-        mtime = mtime,
-    )
-
-
-def try_parse_node_state(parser: ParseState, segments: LineSegments) -> Optional[NodeState]:
-    skip_whitespace(parser)
-    start_pos = parser.pos
-
-    for node_state, node_state_sym in NODE_STATE_SYMBOLS.items():
-        if try_consume(parser, node_state_sym):
-            segments.node_state = Span(start_pos, parser.pos)
-            return node_state
-
-    return None
-
-
-def parse_node_id(parser: ParseState) -> DecoratedNodeID:
-    gen_id = parse_int(parser, "generation ID")
-    consume(parser, ":")
-    node_id = parse_int(parser, "node ID")
-
-    is_executable = False
-    if try_consume(parser, "x"):
-        is_executable = True
-
-    consume(parser, " ")
-
-    return DecoratedNodeID(
-        id = (gen_id, node_id),
-        is_executable = is_executable,
-    )
-
-
-def parse_node_name(parser: ParseState, segments: Optional[LineSegments]) -> tuple[NodeKind, str]:
-    skip_whitespace(parser)
-
-    if parser.char() in ["'", '"']:
-        raise Exception("TODO: quoted names")
-
-    else:
-        name_start = parser.pos
-        while not parser.done() and not parser.tail().startswith("->"):
-            parser.advance()
-
-        name_end = parser.pos
-        if name_start == name_end:
-            raise Exception("Expected node name")
-
-        if segments is not None:
-            segments.name = Span(name_start, name_end)
-
-        name = parser.text[name_start:name_end].strip()
-        kind = NodeKind.FILE
-        if name.endswith("/"):
-            name = name[:-1]
-            if not name:
-                raise Exception("Expected node name")
-
-            kind = NodeKind.DIRECTORY
-
-        return (kind, name)
-
-
-def parse_link_status(parser: ParseState) -> tuple[LinkStatus, Optional[Path]]:
-    link_target = None
-    link_status = LinkStatus.NO_LINK
-    skip_whitespace(parser)
-    if try_consume(parser, "->"):
-        if try_consume(parser, "!"):
-            link_status = LinkStatus.BROKEN
-        elif try_consume(parser, "?"):
-            link_status = LinkStatus.UNKNOWN
-        else:
-            link_status = LinkStatus.GOOD
-
-        link_target = Path(parse_node_name(parser, None)[1])
-
-    return link_status, link_target
-
 
 
 # DirView: printing
@@ -632,7 +278,7 @@ def write_entries(out: TextIO, entries: list[DirNode], column_widths: list[int],
             # ATTENTION: This must be kept in sync with the computation of `details_width` in `write_tree()` and with `compute_column_widths()`
             out.write(f"[{d.mode:<{c1_width}} {d.user:<{c2_width}} {d.group:<{c3_width}} {d.size:>{c4_width}} {d.mtime:<{c5_width}}] ")
 
-        out.write(indent * INDENT_WIDTH * " ")
+        out.write(indent * CONFIG.indent_width * " ")
 
         node_state = "|"
         if entry.is_dir():
@@ -660,8 +306,8 @@ def write_entries(out: TextIO, entries: list[DirNode], column_widths: list[int],
             if entry.link_target is not None:
                 out.write(f" {entry.link_target}")
 
-            if entry.kind == NodeKind.DIRECTORY:
-                out.write("/")
+                if entry.kind == NodeKind.DIRECTORY and entry.link_target.name != "": # Root dir has no name
+                    out.write("/")
 
         out.write("\n")
 
@@ -715,13 +361,13 @@ def unescape_filename(filename: str) -> str:
     return filename
 
 
-# Parsing
+# Filesystem operations
 #-----------------------------------------------------------
 def compute_operations(view: DirView, lines: list[str], indent_offset: int) -> list[dict]:
     old_nodes_by_id = _nodes_by_id(view.tree.root)
     operations: list[dict] = []
 
-    buf_tree, buf_nodes_by_id = parse_tree(view.root_dir(), lines, indent_offset)
+    buf_tree, buf_nodes_by_id = parse_tree(CONFIG, view.root_dir(), lines, indent_offset)
     _compute_operations(view.root_dir(), old_nodes_by_id, buf_tree.root.children, operations)
 
     deleted_nodes = old_nodes_by_id.keys() - buf_nodes_by_id.keys()
@@ -810,12 +456,12 @@ def _nodes_by_id(node: DirNode) -> dict[NodeID, DirNode]:
 #===============================================================================
 # Initializes a new Vfx buffer
 def init():
-    global SESSIONS, GLOBAL_STATE
+    global SESSIONS, GLOBAL_TREE_STATE
 
-    if not GLOBAL_STATE.root_dir:
-        GLOBAL_STATE.root_dir = Path.cwd()
+    if not GLOBAL_TREE_STATE.root_dir:
+        GLOBAL_TREE_STATE.root_dir = Path.cwd()
 
-    buf_name = make_buf_name(str(GLOBAL_STATE.root_dir))
+    buf_name = make_buf_name(str(GLOBAL_TREE_STATE.root_dir))
 
     # The directory buffer should have no influence on the alternative file.
     # To this end, we need to update the alt file in two situations:
@@ -851,17 +497,16 @@ def init():
         alternate_buf = alt_buf,
         view = DirView(
             next_gen_id(),
-            GLOBAL_STATE.root_dir,
-            GLOBAL_STATE.expanded_dirs,
-            GLOBAL_STATE.show_dotfiles,
-            GLOBAL_STATE.show_details,
+            GLOBAL_TREE_STATE.root_dir,
+            GLOBAL_TREE_STATE.expanded_dirs,
+            GLOBAL_TREE_STATE.show_dotfiles,
+            GLOBAL_TREE_STATE.show_details,
         )
     )
 
     update_buffer()
-    vim.command(f'normal {GLOBAL_STATE.cursor_line}G')
-    if GLOBAL_STATE.cursor_column > 1:
-        vim.command(f'normal 0{GLOBAL_STATE.cursor_column-1}l')
+    vim_set_line_no(GLOBAL_TREE_STATE.cursor_line)
+    vim_set_column_no(GLOBAL_TREE_STATE.cursor_column)
 
 
 def quit():
@@ -959,10 +604,10 @@ def update_buffer():
         vim_set_buffer_contents(buf.readlines())
 
         if s.indent_offset:
-            vim.command(f"setl varsofttabstop={s.indent_offset+2},{INDENT_WIDTH}")
+            vim.command(f"setl varsofttabstop={s.indent_offset+2},{CONFIG.indent_width}")
             # There is also 'vartabstop' in case I want to support tabs for indentation
         else:
-            vim.command(f"setl varsofttabstop=2,{INDENT_WIDTH}")
+            vim.command(f"setl varsofttabstop=2,{CONFIG.indent_width}")
 
     vim.command("setl nomodified") # Don't mark the buffer as modified
 
@@ -1048,7 +693,7 @@ def get_indent_for_vim(line_no: int) -> int:
     if not prev_line:
         return 0
 
-    _, segments = parse_line(prev_line)
+    _, segments = parse_line(CONFIG, prev_line)
 
     # We want the indentation to be where the filename on the previous line starts.
     # However, the visual position depends on the value of 'conceallevel'
@@ -1063,4 +708,7 @@ def get_indent_for_vim(line_no: int) -> int:
     # count the number of '\t' that occur in
     # `prev_line[:segments.node_state.start]` and multiply that with
     # `vim.eval("&tabstop")`.
-    return segments.node_state.start + 2 # +1 for the conceal-character and +1 for the following space
+    if segments.node_state is not None:
+        return segments.node_state.start + 2 # +1 for the conceal-character and +1 for the following space
+    else:
+        return segments.name.start
