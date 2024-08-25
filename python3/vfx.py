@@ -236,11 +236,11 @@ def move_file(vim_buffer, new_filepath: Path):
         # Move the actual file
         old_filepath.replace(new_filepath)
 
-        vim.command(f"buffer {vim_buffer.number}")
+        vim.command(f"keepalt buffer {vim_buffer.number}")
         vim.command("silent write!") # ! because the file already exists
 
     finally:
-        vim.command(f"buffer {cur_buf_no_bkp}")
+        vim.command(f"keepalt buffer {cur_buf_no_bkp}")
         vim.command(f"setl bufhidden={cur_bufhidden_bkp}")
 
 
