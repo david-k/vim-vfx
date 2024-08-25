@@ -127,8 +127,14 @@ def is_dir_empty(path: Path) -> bool:
 def escape_for_vim_expr(text: str):
     return "'" + text.replace("'", "''") + "'"
 
-def escape_for_vim_command(text: str):
-    return re.sub(r'(\n| |\t|\r|\\)', r'\\\1', text)
+def escape_fn_for_vim_cmd(text: str):
+    #return re.sub(r'(\n| |\t|\r|\\)', r'\\\1', text)
+
+    esc = vim.eval(f'fnameescape( {escape_for_vim_expr(text)} )')
+    if esc == "" and text != "":
+        raise Exception("fnameescape() failed")
+
+    return esc
 
 
 def vim_set_buffer_contents(lines: list[str]):
@@ -178,19 +184,64 @@ def make_buf_name(path: str) -> str:
         counter += 1
 
 
-def rename_buffer(new_name: str):
-    # `:file NEW_NAME` can be used to rename a buffer.
-    # However, this creates a new unlisted buffer with the old name and sets the
-    # alternate file to that buffer. Thus, we need to do some extra work to make
-    # it appear as if this does not happen.
+def rename_nonfile_buffer(vim_buffer, new_name: str):
+    last_buf_nr = int(vim.eval('bufnr("$")'))
+    old_name = vim_buffer.name
+    vim_buffer.name = new_name
 
-    alt_buf = vim.eval('bufnr("#")')
+    # Renaming a buffer creates a new, unlisted buffer with the previous buffer name.
+    # Delete this new buffer.
+    new_last_buf_nr = int(vim.eval('bufnr("$")'))
+    if new_last_buf_nr > last_buf_nr:
+        last_buf = vim.buffers[new_last_buf_nr]
+        # This condition should always be true, but check anyway so we don't
+        # accidentally wipe the wrong buffer
+        if last_buf.name == old_name:
+            vim.command(f'bwipeout {last_buf.number}')
 
-    vim.command('file ' + escape_for_vim_command(new_name))
-    prev_name_buf = vim.eval('bufnr("#")')
-    vim.command('bwipeout ' + prev_name_buf)
 
-    vim.command(f"let @# = {alt_buf}")
+def move_file(vim_buffer, new_filepath: Path):
+    old_filepath = Path(vim_buffer.name)
+    rename_nonfile_buffer(vim_buffer, str(new_filepath))
+
+    # After having renamed the buffer with the above call to
+    # `rename_nonfile_buffer()` we still need to do the following:
+    #
+    # 1. Moving the actual file
+    # 2. Write the renamed buffer to disk, overwriting the moved file from the first step.
+    #
+    # The second step may seem redundant, but here are the reasons:
+    # - There does not seem a way around the fact that we need to execute
+    #   something like :saveas or :write. Otherwise, Vim will complain that the
+    #   file on disk has changed (either when activating the buffer again or
+    #   when trying to save).
+    # - However, when writing a new file with :saveas or :write, file
+    #   permissions are not preserved. Thus, we move the original file to its
+    #   intended destination -- ensuring that all file attributes are preserved
+    #   -- even though we then immediatly overwrite it with the contents of then
+    #   buffer.
+    #
+    # This means that moving a file that is connected to a Vim buffer will
+    # always save the buffer to disk. I don't quite like it, but this seems to
+    # be the least annoying solution to me.
+    #
+    # (Isn't it kind of ridiculous that Vim doesn't have a builtin command to
+    # properly move a file together with its buffer?)
+
+    cur_buf_no_bkp = vim.current.buffer.number
+    cur_bufhidden_bkp = vim.eval("&bufhidden")
+    vim.command(f"setl bufhidden=hide") # Don't wipe buffer when switching to another one
+
+    try:
+        # Move the actual file
+        old_filepath.replace(new_filepath)
+
+        vim.command(f"buffer {vim_buffer.number}")
+        vim.command("silent write!") # ! because the file already exists
+
+    finally:
+        vim.command(f"buffer {cur_buf_no_bkp}")
+        vim.command(f"setl bufhidden={cur_bufhidden_bkp}")
 
 
 def is_buf_modified() -> bool:
@@ -231,7 +282,7 @@ def get_name_at(line: str) -> str:
     return node.name
 
 
-# DirView: printing
+# Printing
 #-----------------------------------------------------------
 NUM_DETAIL_COLUMNS = 5
 
@@ -245,7 +296,7 @@ def print_entries(entries: list[DirNode], max_id_width: int = 6):
         print(buf.getvalue())
 
 
-def write_tree(out: TextIO, view: DirView):
+def write_tree(out: TextIO, view: DirView) -> int:
     column_widths = [0] * (NUM_DETAIL_COLUMNS + 1)
     column_widths[-1] = len(str(view.tree.last_entry_id))
 
@@ -482,7 +533,7 @@ def init():
     # Initially, I was using `bufadd()` instead of `:edit` but this leaves the
     # "[No Name]" buffer behind. `:edit` on the other hand automatically closes
     # that buffer if it is empty.
-    vim.command("edit " + escape_for_vim_command(buf_name))
+    vim.command("edit " + escape_fn_for_vim_cmd(buf_name))
     vim.command('setlocal bufhidden=wipe')
     vim.command('setlocal buftype=acwrite')
     vim.command('setlocal noswapfile')
@@ -541,12 +592,12 @@ def open_entry():
         update_buffer()
 
         new_name = make_buf_name(str(s.view.root_dir()))
-        rename_buffer(new_name)
+        rename_nonfile_buffer(vim.current.buffer, new_name)
     else:
         default_app = default_app_for(filepath)
         if should_open_in_vim(default_app):
             on_exit(s)
-            vim.command("keepalt edit " + escape_for_vim_command(str(filepath)))
+            vim.command("keepalt edit " + escape_fn_for_vim_cmd(str(filepath)))
         else:
             subprocess.Popen(["xdg-open", filepath], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -571,7 +622,7 @@ def move_up():
         update_buffer()
 
         new_name = make_buf_name(str(s.view.root_dir()))
-        rename_buffer(new_name)
+        rename_nonfile_buffer(vim.current.buffer, new_name)
 
 
 def toggle_dotfiles():
@@ -603,13 +654,11 @@ def update_buffer():
         buf.seek(0, io.SEEK_SET)
         vim_set_buffer_contents(buf.readlines())
 
-        if s.indent_offset:
-            vim.command(f"setl varsofttabstop={s.indent_offset+2},{CONFIG.indent_width}")
-            # There is also 'vartabstop' in case I want to support tabs for indentation
-        else:
-            vim.command(f"setl varsofttabstop=2,{CONFIG.indent_width}")
+        first_tab_stop = s.indent_offset + CONFIG.node_state_symbol_width + 1 # +1 for the space following the node state symbol
+        vim.command(f"setl varsofttabstop={first_tab_stop},{CONFIG.indent_width}")
+        # There is also 'vartabstop' in case I want to support tabs for indentation
 
-    vim.command("setl nomodified") # Don't mark the buffer as modified
+    vim.command("setl nomodified")
 
 
 # For internal use only. Called when the BufWriteCmd autocmd event is fired.
@@ -635,6 +684,8 @@ def on_buf_save():
 
         choice = int(vim.eval('confirm("Apply changes?", "yes\nno", 2)'))
         if choice == 1:
+            buffers_by_name = {buf.name: buf for buf in vim.buffers if buf.valid}
+
             for op in operations:
                 if op["kind"] == "touch":
                     if op["filepath"].exists():
@@ -662,10 +713,16 @@ def on_buf_save():
                         print("Aborting")
                         return
                     else:
-                        op["old_filepath"].rename(op["new_filepath"])
+                        # For the lookup to work op["old_filepath"] needs to denote an absolute path
+                        buffer = buffers_by_name.get(str(op["old_filepath"]))
+                        if buffer is None:
+                            op["old_filepath"].rename(op["new_filepath"])
+                        else:
+                            move_file(buffer, op["new_filepath"])
 
                 else:
                     raise Exception("Unsupported op: " + op["kind"])
+
 
             s.view.refresh_from_fs()
             update_buffer()

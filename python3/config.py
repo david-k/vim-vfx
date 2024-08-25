@@ -25,6 +25,6 @@ def default_config() -> Config:
             NodeState.DIR_CLOSED: "+",
         },
 
-        # All node_state_symbols must have the same length
+        # All node_state_symbols must consist of the same number of glyphs
         node_state_symbol_width = 1,
     )

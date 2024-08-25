@@ -22,9 +22,6 @@ from dir_tree import (
 )
 
 
-T = TypeVar("T")
-
-
 # Parser
 #===============================================================================
 @dataclass
@@ -32,7 +29,6 @@ class ParseState:
     text: str
     pos: int = 0
 
-    # TODO Reduce copying slices
 
     def char(self) -> Optional[str]:
         return None if self.done() else self.text[self.pos]
@@ -41,7 +37,7 @@ class ParseState:
         return False if self.done() else f(self.text[self.pos])
 
     def tail(self) -> str:
-        return self.text[self.pos:]
+        return self.text[self.pos:] # TODO This creates a copy
 
     def done(self) -> bool:
         return self.pos == len(self.text)
@@ -51,7 +47,7 @@ class ParseState:
 
 
 def skip_whitespace(parser: ParseState):
-    while parser.check_char(lambda ch: ch in [" ", "\t", "\r"]):
+    while parser.check_char(lambda ch: ch in [" ", "\t"]):
         parser.advance()
 
 
@@ -89,18 +85,7 @@ def consume(parser: ParseState, s: str):
     parser.advance(len(s))
 
 
-def parse_identifier(parser: ParseState) -> str:
-    start = parser.pos
-    while not parser.done() and unwrap(parser.char()).isalnum():
-        parser.advance()
-
-    if parser.pos == start:
-        raise Exception("Expected identifier: " + parser.text[start:])
-
-    return parser.text[start:parser.pos]
-
-
-def parse_until(parser: ParseState, chars: list[str]) -> str:
+def consume_until(parser: ParseState, chars: list[str]) -> str:
     start = parser.pos
     while not parser.done() and unwrap(parser.char()) not in chars:
         parser.advance()
@@ -120,6 +105,7 @@ def is_digit(s: str) -> bool:
     return True
 
 
+T = TypeVar("T")
 def unwrap(v: Optional[T]) -> T:
     if v is None:
         raise Exception("unwrapping None")
@@ -164,7 +150,7 @@ def compute_indent(config: Config, segments: LineSegments, indent_offset: int) -
         # Even if there is no node state we calculate the indentation as if there was
         first_significant_char = segments.name.start - config.node_state_symbol_width - 1
 
-    indent = (first_significant_char - indent_offset) // config.indent_width
+    indent = max(first_significant_char - indent_offset, 0) // config.indent_width
     return indent
 
 
@@ -282,19 +268,19 @@ def try_parse_details(parser: ParseState, segments: LineSegments) -> Optional[No
         return None
 
     start_pos = parser.pos
-    mode = parse_until(parser, [" "]).strip()
+    mode = consume_until(parser, [" "]).strip()
 
     skip_whitespace(parser)
-    user = parse_until(parser, [" "]).strip()
+    user = consume_until(parser, [" "]).strip()
 
     skip_whitespace(parser)
-    group = parse_until(parser, [" "]).strip()
+    group = consume_until(parser, [" "]).strip()
 
     skip_whitespace(parser)
-    size = parse_until(parser, [" "]).strip()
+    size = consume_until(parser, [" "]).strip()
 
     skip_whitespace(parser)
-    mtime = parse_until(parser, ["]"]).strip()
+    mtime = consume_until(parser, ["]"]).strip() # TODO Proper datetime parsing
 
     skip_whitespace(parser)
     consume(parser, "]")
