@@ -2,6 +2,7 @@ import vim # type: ignore
 import io
 import re
 import subprocess
+import shutil
 from pathlib import Path
 
 from enum import Enum
@@ -31,6 +32,7 @@ from dir_parser import (
     parse_line,
     parse_tree,
     compute_indent,
+    NODE_FLAGS_LEN,
 )
 
 
@@ -231,14 +233,10 @@ def move_file(vim_buffer, new_filepath: Path):
     cur_buf_no_bkp = vim.current.buffer.number
     cur_bufhidden_bkp = vim.eval("&bufhidden")
     vim.command(f"setl bufhidden=hide") # Don't wipe buffer when switching to another one
-
     try:
-        # Move the actual file
         old_filepath.replace(new_filepath)
-
         vim.command(f"keepalt buffer {vim_buffer.number}")
         vim.command("silent write!") # ! because the file already exists
-
     finally:
         vim.command(f"keepalt buffer {cur_buf_no_bkp}")
         vim.command(f"setl bufhidden={cur_bufhidden_bkp}")
@@ -312,7 +310,6 @@ def write_tree(out: TextIO, view: DirView) -> int:
         details_width += 1 # Space after closing bracket
 
     write_entries(out, view.tree.root.children, column_widths)
-
     return details_width
 
 
@@ -338,9 +335,11 @@ def write_entries(out: TextIO, entries: list[DirNode], column_widths: list[int],
             else:
                 node_state = "+"
 
-        out.write(f"{node_state}{entry.id[0]}:{entry.id[1]:0{max_id_width}}")
+        out.write(f"{node_state}{entry.id[0]}:{entry.id[1]:0{max_id_width}}") # TODO Also need a max_width for gen id
         if entry.is_executable:
             out.write("x")
+        else:
+            out.write("_")
 
         out.write(" " + escape_if_needed(str(entry.name)))
         if entry.kind == NodeKind.DIRECTORY:
@@ -361,7 +360,6 @@ def write_entries(out: TextIO, entries: list[DirNode], column_widths: list[int],
                     out.write("/")
 
         out.write("\n")
-
         if len(entry.children):
             write_entries(out, entry.children, column_widths, indent + 1)
 
@@ -379,7 +377,6 @@ def compute_column_widths(nodes: list[DirNode], widths: list[int]):
 
         if node.is_dir():
             compute_column_widths(node.children, widths)
-
 
 
 def escape_if_needed(filename: str) -> str:
@@ -412,83 +409,121 @@ def unescape_filename(filename: str) -> str:
     return filename
 
 
-# Filesystem operations
+# Compute node changes
 #-----------------------------------------------------------
-def compute_operations(view: DirView, lines: list[str], indent_offset: int) -> list[dict]:
-    old_nodes_by_id = _nodes_by_id(view.tree.root)
-    operations: list[dict] = []
-
-    buf_tree, buf_nodes_by_id = parse_tree(CONFIG, view.root_dir(), lines, indent_offset)
-    _compute_operations(view.root_dir(), old_nodes_by_id, buf_tree.root.children, operations)
-
-    deleted_nodes = old_nodes_by_id.keys() - buf_nodes_by_id.keys()
-    for entry_id in deleted_nodes:
-        entry = old_nodes_by_id[entry_id]
-        op_kind = "rm"
-        if entry.is_dir():
-            if is_dir_empty(view.root_dir() / entry.filepath()):
-                op_kind = "rmdir"
-            else:
-                op_kind = "rm-rec"
-
-        operations.append({
-            "kind": op_kind,
-            "filepath": view.root_dir() / entry.filepath()
-        })
-
-    return operations
+@dataclass
+class NodeChangeInfo:
+    old_node: Optional[DirNode] = None
+    new_occurrences: list[DirNode] = field(default_factory=list)
+    explicitly_removed: bool = False
+    # So we know that we don't need to generate explicit REMOVE operations if the parent is already being removed
+    implicitly_removed_by: Optional[NodeID] = None
 
 
-def _compute_operations(
-    root_dir: Path,
-    old_nodes_by_id: dict[NodeID, DirNode],
-    buf_nodes: list[DirNode],
-    # Output:
-    operations: list[dict]
-):
-    for buf_entry in buf_nodes:
-        if buf_entry.id[0] == -1:
-            # This is a new entry
+class NodeChanges:
+    old_nodes_by_id: dict[NodeID, DirNode]
+    changes: dict[NodeID, NodeChangeInfo]
 
-            if buf_entry.link_target is not None:
-                raise Exception("TODO Creating links is not supported yet")
+    def __init__(self, old_nodes_by_id: dict[NodeID, DirNode]):
+        self.old_nodes_by_id = old_nodes_by_id
+        self.changes = {}
 
-            if buf_entry.is_file():
-                operations.append({
-                    "kind": "touch",
-                    "filepath": root_dir / buf_entry.filepath(),
-                })
-            elif buf_entry.is_dir():
-                operations.append({
-                    "kind": "mkdir",
-                    "filepath": root_dir / buf_entry.filepath(),
-                })
-
-        elif buf_entry.id in old_nodes_by_id:
-            # This is an existing entry, possibly modified
-            old_entry = old_nodes_by_id[buf_entry.id]
-            if buf_entry.kind != old_entry.kind:
-                raise Exception("TODO Changing the entry type is not supported yet")
-
-            if buf_entry.link_target != old_entry.link_target:
-                raise Exception("TODO Changing link target is not supported yet")
-
-            if buf_entry.filepath() != old_entry.filepath():
-                operations.append({
-                    "kind": "mv",
-                    "old_filepath": root_dir / old_entry.filepath(),
-                    "new_filepath": root_dir / buf_entry.filepath(),
-                })
-
+    def node_new_occurrence(self, new_node: DirNode):
+        # Is this is a new entry?
+        if new_node.id[0] == -1:
+            change_info = self._get_changes_for_new_node(new_node)
+            change_info.new_occurrences.append(new_node)
+        # Or is this an existing entry, possibly modified?
+        elif old_node := self.old_nodes_by_id.get(new_node.id):
+            change_info = self._get_changes_for_existing_node(old_node)
+            change_info.new_occurrences.append(new_node)
         else:
-            raise Exception("Invalid entry id: " + str(buf_entry.id))
+            raise Exception(f"Invalid node id: {new_node.id}")
 
-        if buf_entry.is_dir():
-            _compute_operations(root_dir, old_nodes_by_id, buf_entry.children, operations)
+    def node_removed(self, old_node: DirNode):
+        change_info = self._get_changes_for_existing_node(old_node)
+        change_info.explicitly_removed = True
+        self._mark_nodes_implicitly_removed(old_node.children, old_node.id)
+
+    def _mark_nodes_implicitly_removed(self, old_nodes: list[DirNode], implicitly_removed_by: NodeID):
+        for old_node in old_nodes:
+            change_info = self._get_changes_for_existing_node(old_node)
+            change_info.implicitly_removed_by = implicitly_removed_by
+            if old_node.is_dir():
+                self._mark_nodes_implicitly_removed(old_node.children, implicitly_removed_by)
+
+    def _get_changes_for_existing_node(self, old_node: DirNode) -> NodeChangeInfo:
+        change_info = self.changes.setdefault(old_node.id, NodeChangeInfo(old_node=old_node))
+        assert change_info.old_node is old_node
+        return change_info
+
+    def _get_changes_for_new_node(self, new_node: DirNode) -> NodeChangeInfo:
+        change_info = self.changes.setdefault(new_node.id, NodeChangeInfo())
+        assert change_info.old_node is None
+        assert not change_info.explicitly_removed
+        return change_info
+
+
+def compute_node_changes(view: DirView, lines: list[str], indent_offset: int) -> NodeChanges:
+    node_changes = NodeChanges(_nodes_by_id(view.tree.root))
+    buf_tree = parse_tree(CONFIG, view.root_dir(), lines, indent_offset)
+    _compute_node_changes(view.tree.root.children, buf_tree.root.children, node_changes)
+    return node_changes
+
+
+def _compute_node_changes(
+    old_nodes: list[DirNode],
+    new_nodes: list[DirNode],
+    # Output:
+    node_changes: NodeChanges
+):
+    # For the old nodes, there is a one-to-one mapping between node IDs and nodes
+    old_nodes_by_id: dict[NodeID, DirNode] = {node.id:node for node in old_nodes}
+    # However, there may be multiple new nodes with the same ID (because of COPYing)
+    new_nodes_by_id: dict[NodeID, list[DirNode]] = {}
+    for new_node in new_nodes:
+        new_nodes_by_id.setdefault(new_node.id, []).append(new_node)
+
+    # Handle new and modified nodes
+    for (new_node_id, new_nodes_with_same_id) in new_nodes_by_id.items():
+        # If the new node ID existed previously we need to detemine if anything has changed
+        if old_node := old_nodes_by_id.get(new_node_id):
+            old_node_removed = True
+            for new_node in new_nodes_with_same_id:
+                if new_node.kind != old_node.kind:
+                    raise Exception("TODO Changing node kind not supported yet")
+
+                if new_node.link_target != old_node.link_target:
+                    raise Exception("TODO Changing link target is not supported yet")
+
+                if new_node.name == old_node.name:
+                    old_node_removed = False
+                else:
+                    node_changes.node_new_occurrence(new_node)
+
+                if new_node.is_dir():
+                    _compute_node_changes(old_node.children, new_node.children, node_changes)
+
+            if old_node_removed:
+                node_changes.node_removed(old_node)
+        else:
+            _add_new_occurrences_recursively(new_nodes_with_same_id, node_changes)
+
+    # Handle removed nodes
+    removed_node_ids = old_nodes_by_id.keys() - new_nodes_by_id.keys()
+    for removed_node_id in removed_node_ids:
+        node_changes.node_removed(old_nodes_by_id[removed_node_id])
+
+
+def _add_new_occurrences_recursively(new_nodes: list[DirNode], node_changes: NodeChanges) -> None:
+    for new_entry in new_nodes:
+        if new_entry.is_dir():
+            _add_new_occurrences_recursively(new_entry.children, node_changes)
+
+        node_changes.node_new_occurrence(new_entry)
 
 
 def _nodes_by_id(node: DirNode) -> dict[NodeID, DirNode]:
-
     def _nodes_by_id_rec(
         node: DirNode,
         nodes_out: dict[NodeID, DirNode]
@@ -503,7 +538,31 @@ def _nodes_by_id(node: DirNode) -> dict[NodeID, DirNode]:
     return nodes_out
 
 
-# Externally called functions
+# Filesystem operations
+#-----------------------------------------------------------
+def compute_operations(node_changes: NodeChanges) -> list[dict]:
+    operations = []
+    for change in node_changes.changes.values():
+        if change.old_node is None:
+            for new_node in change.new_occurrences:
+                operations.append({"kind": "NEW", "node": new_node})
+        else:
+            if change.explicitly_removed:
+                if len(change.new_occurrences) == 1:
+                    operations.append({"kind": "MOVE", "old_node": change.old_node, "new_node": change.new_occurrences[0]})
+                else:
+                    for new_node in change.new_occurrences:
+                        operations.append({"kind": "COPY", "old_node": change.old_node, "new_node": new_node})
+                    operations.append({"kind": "REMOVE", "node": change.old_node})
+            else:
+                for new_node in change.new_occurrences:
+                    operations.append({"kind": "COPY", "old_node": change.old_node, "new_node": new_node})
+
+    return operations
+
+
+
+# Functions that are called from Vim
 #===============================================================================
 # Initializes a new Vfx buffer
 def init():
@@ -666,59 +725,74 @@ def on_buf_save():
     if is_buf_modified():
         s = get_session(); assert s
 
-        operations = compute_operations(s.view, vim.current.buffer, s.indent_offset)
-
+        node_changes = compute_node_changes(s.view, vim.current.buffer, s.indent_offset)
+        operations = compute_operations(node_changes)
         if not operations:
             vim.command("setl nomodified") # Don't mark the buffer as modified
             return
 
         for op in operations:
-            if op["kind"] in ["touch", "rm"]:
-                print(op["kind"] + " " + str(op["filepath"]))
-            elif op["kind"] in ["mkdir", "rm-rec", "rmdir"]:
-                print(op["kind"] + " " + str(op["filepath"]) + "/")
-            elif op["kind"] == "mv":
-                print(op["kind"] + " " + str(op["old_filepath"]) + " -> " + str(op["new_filepath"]))
+            if op["kind"] == "NEW":
+                cmd = "MKDIR" if op['node'].is_dir() else "TOUCH"
+                print(f"{cmd} {op['node'].filepath_str()}")
+            elif op["kind"] == "REMOVE":
+                cmd = "REMOVE-REC" if op['node'].is_dir() else "REMOVE"
+                print(f"{cmd} {op['node'].filepath_str()}")
+            elif op["kind"] == "COPY":
+                cmd = "COPY-REC" if op['old_node'].is_dir() else "COPY"
+                print(f"COPY {op['old_node'].filepath_str()} -> {op['new_node'].filepath_str()}")
+            elif op["kind"] == "MOVE":
+                print(f"MOVE {op['old_node'].filepath_str()} -> {op['new_node'].filepath_str()}")
             else:
                 raise Exception("Unsupported op: " + op["kind"])
 
         choice = int(vim.eval('confirm("Apply changes?", "yes\nno", 2)'))
         if choice == 1:
             buffers_by_name = {buf.name: buf for buf in vim.buffers if buf.valid}
-
             for op in operations:
-                if op["kind"] == "touch":
-                    if op["filepath"].exists():
-                        print("Error: destination already exists: " + str(op["filepath"]))
-                        print("Aborting")
-                        return
-                    else:
-                        op["filepath"].touch()
-
-                elif op["kind"] == "mkdir":
-                    op["filepath"].mkdir(parents=True)
-
-                elif op["kind"] == "rmdir":
-                    op["filepath"].rmdir()
-
-                elif op["kind"] == "rm":
-                    subprocess.run(["trash", "--", op["filepath"]])
-
-                elif op["kind"] == "rm-rec":
-                    subprocess.run(["trash", "--", op["filepath"]])
-
-                elif op["kind"] == "mv":
-                    if op["new_filepath"].exists():
-                        print("Error: destination already exists: " + str(op["new_filepath"]))
-                        print("Aborting")
-                        return
-                    else:
-                        # For the lookup to work op["old_filepath"] needs to denote an absolute path
-                        buffer = buffers_by_name.get(str(op["old_filepath"]))
-                        if buffer is None:
-                            op["old_filepath"].rename(op["new_filepath"])
+                if op["kind"] == "NEW":
+                    filepath = s.view.root_dir() / op["node"].filepath()
+                    if op["node"].is_file():
+                        if filepath.exists():
+                            print("Error: destination already exists: " + str(filepath))
+                            print("Aborting")
+                            return
                         else:
-                            move_file(buffer, op["new_filepath"])
+                            filepath.touch()
+                    else:
+                        filepath.mkdir(parents=True)
+
+                elif op["kind"] == "REMOVE":
+                    filepath = s.view.root_dir() / op["node"].filepath()
+                    subprocess.run(["trash", "--", filepath])
+
+                elif op["kind"] == "COPY":
+                    old_filepath = s.view.root_dir() / op["old_node"].filepath()
+                    new_filepath = s.view.root_dir() / op["new_node"].filepath()
+                    if new_filepath.exists():
+                        print("Error: destination already exists: " + str(new_filepath))
+                        print("Aborting")
+                        return
+                    else:
+                        if op["old_node"].is_file():
+                            shutil.copyfile(old_filepath, new_filepath, follow_symlinks=False)
+                        else:
+                            shutil.copytree(old_filepath, new_filepath, symlinks=True)
+
+                elif op["kind"] == "MOVE":
+                    old_filepath = s.view.root_dir() / op["old_node"].filepath()
+                    new_filepath = s.view.root_dir() / op["new_node"].filepath()
+                    if new_filepath.exists():
+                        print("Error: destination already exists: " + str(new_filepath))
+                        print("Aborting")
+                        return
+                    else:
+                        # For the lookup to work old_filepath needs to denote an absolute path
+                        buffer = buffers_by_name.get(str(old_filepath))
+                        if buffer is None:
+                            old_filepath.rename(new_filepath)
+                        else:
+                            move_file(buffer, new_filepath)
 
                 else:
                     raise Exception("Unsupported op: " + op["kind"])

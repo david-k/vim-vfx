@@ -17,13 +17,11 @@ class NodeKind(Enum):
     DIRECTORY = 1
     FILE = 2
 
-
 class LinkStatus(Enum):
     NO_LINK = 1
     GOOD = 2
     BROKEN = 3
     UNKNOWN = 4
-
 
 @dataclass
 class NodeDetails:
@@ -37,21 +35,20 @@ class NodeDetails:
 @dataclass
 class DirNode:
     id: NodeID
-    name: str # For all non-root nodes, the name does not contain any path separators
+    name: str # Only the root node is allowed to contain path separators
     kind: NodeKind
     parent: Optional["DirNode"] = None
+    details: Optional[NodeDetails] = None
 
     link_status: LinkStatus = LinkStatus.NO_LINK
     link_target: Optional[Path] = None
 
-    # For files
+    # For files:
     is_executable: bool = False
 
-    # For directories
+    # For directories:
     is_expanded: bool = False
     children: list["DirNode"] = field(default_factory=list)
-
-    details: Optional[NodeDetails] = None
 
     def is_dir(self) -> bool:
         return self.kind == NodeKind.DIRECTORY
@@ -68,6 +65,10 @@ class DirNode:
             return self.parent.filepath() / self.name
 
         return Path()
+
+    def filepath_str(self) -> str:
+        filepath = str(self.filepath())
+        return filepath + "/" if self.is_dir() else filepath
 
 
 class DirTree:
@@ -220,7 +221,7 @@ class DirView:
             # Sorting by `not is_dir()` puts directories first and everything else
             # second (including broken links, for which both is_dir() and is_file()
             # return false)
-            return (not entry_is_dir(entry), entry.name)
+            return (not _entry_is_dir(entry), entry.name)
 
         path = self.root_dir() / node.filepath()
         child_entries: list[os.DirEntry] = [entry for entry in os.scandir(path) if self.show_dotfiles or not entry.name.startswith(".")]
@@ -272,7 +273,7 @@ class DirView:
 
         return self.tree.make_node(
             name = entry.name,
-            kind = NodeKind.DIRECTORY if entry_is_dir(entry) else NodeKind.FILE,
+            kind = NodeKind.DIRECTORY if _entry_is_dir(entry) else NodeKind.FILE,
             parent = parent,
             is_executable = is_executable,
             link_target = link_target,
@@ -296,7 +297,7 @@ class DirView:
         return None
 
 
-def entry_is_dir(entry: os.DirEntry) -> bool:
+def _entry_is_dir(entry: os.DirEntry) -> bool:
     # We may get a permission error if `entry` is a symlink and points
     # to a directory that we don't have access to. In this case, we treat
     # `entry` as a file

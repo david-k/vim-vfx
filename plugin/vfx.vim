@@ -41,10 +41,10 @@ endfunction
 autocmd FileType vfx syntax match VfxLeadingSpace "^[ \t]*" nextgroup=VfxID,VfxAdded
 autocmd FileType vfx syntax region VfxDetails start="^\[" end="\][ \t]*" nextgroup=VfxID
 
-autocmd FileType vfx syntax match VfxID "|[0-9]\+:[0-9]\+" contained conceal cchar=|
+autocmd FileType vfx syntax match VfxID "|[0-9]\+:[0-9]\+_" contained conceal cchar=|
 autocmd FileType vfx syntax match VfxID "|[0-9]\+:[0-9]\+x" contained conceal cchar=| nextgroup=VfxExecutable
-autocmd FileType vfx syntax match VfxID "+[0-9]\+:[0-9]\+" contained conceal cchar=+ nextgroup=VfxDirectory
-autocmd FileType vfx syntax match VfxID "-[0-9]\+:[0-9]\+" contained conceal cchar=- nextgroup=VfxDirectory
+autocmd FileType vfx syntax match VfxID "+[0-9]\+:[0-9]\+_" contained conceal cchar=+ nextgroup=VfxDirectory
+autocmd FileType vfx syntax match VfxID "-[0-9]\+:[0-9]\+_" contained conceal cchar=- nextgroup=VfxDirectory
 
 " Matches directory entries (those that end with '/').
 " In the search pattern below, \{-1,} denotes non-greedy repetition (with at

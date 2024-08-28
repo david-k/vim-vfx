@@ -84,6 +84,18 @@ def consume(parser: ParseState, s: str):
 
     parser.advance(len(s))
 
+def consume_n(parser: ParseState, n: int) -> str:
+    result = ""
+    while n > 0:
+        if parser.done():
+            raise Exception("Parsing failed: unexpected end")
+
+        result += unwrap(parser.char())
+        parser.advance()
+        n -= 1
+
+    return result
+
 
 def consume_until(parser: ParseState, chars: list[str]) -> str:
     start = parser.pos
@@ -144,20 +156,18 @@ class NewNode:
 
 def compute_indent(config: Config, segments: LineSegments, indent_offset: int) -> int:
     first_significant_char = 0
-    if segments.node_state is not None:
-        first_significant_char = segments.node_state.start
-    else:
+    if segments.node_state is None:
         # Even if there is no node state we calculate the indentation as if there was
         first_significant_char = segments.name.start - config.node_state_symbol_width - 1
+    else:
+        first_significant_char = segments.node_state.start
 
     indent = max(first_significant_char - indent_offset, 0) // config.indent_width
     return indent
 
 
-def parse_tree(config: Config, root_dir: Path, lines: list[str], indent_offset: int) -> tuple[DirTree, dict[NodeID, DirNode]]:
+def parse_tree(config: Config, root_dir: Path, lines: list[str], indent_offset: int) -> DirTree:
     tree = DirTree(-1, root_dir)
-    nodes_by_id: dict[NodeID, DirNode] = {}
-
     parent_stack: list[DirNode] = [tree.root]
     prev_indent = 0
     prev_node: Optional[DirNode] = None
@@ -181,26 +191,18 @@ def parse_tree(config: Config, root_dir: Path, lines: list[str], indent_offset: 
             parent_stack.append(prev_node)
             prev_indent += 1
 
-
         parent = parent_stack[-1]
         match parsed_node:
             case DirNode() as node:
-                if node.id in nodes_by_id:
-                    raise Exception("Duplicate node id: " + str(node.id))
-
                 node.parent = parent
                 parent.children.append(node)
-
-                nodes_by_id[node.id] = node
                 prev_node = node
 
             case NewNode() as new_node:
                 node = tree.lookup_or_create(parent.filepath() / new_node.name, new_node.kind)
-                nodes_by_id[node.id] = node
                 prev_node = node
 
-
-    return tree, nodes_by_id
+    return tree
 
 
 # A single line consists of the following fields:
@@ -308,14 +310,18 @@ def try_parse_node_state(config: Config, parser: ParseState, segments: LineSegme
     return None
 
 
+NODE_FLAGS_LEN = 1
 def parse_node_id(parser: ParseState) -> DecoratedNodeID:
     gen_id = parse_int(parser, "generation ID")
     consume(parser, ":")
     node_id = parse_int(parser, "node ID")
 
     is_executable = False
-    if try_consume(parser, "x"):
+    flags = consume_n(parser, NODE_FLAGS_LEN)
+    if flags == "x":
         is_executable = True
+    elif flags != "_":
+        raise Exception("Invalid node flag: " + flags)
 
     consume(parser, " ")
 
