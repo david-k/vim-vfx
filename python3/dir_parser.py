@@ -171,7 +171,7 @@ def parse_tree(config: Config, root_dir: Path, lines: list[str], indent_offset: 
     parent_stack: list[DirNode] = [tree.root]
     prev_indent = 0
     prev_node: Optional[DirNode] = None
-    for line in lines:
+    for line_idx, line in enumerate(lines):
         if not line.strip():
             continue
 
@@ -195,11 +195,13 @@ def parse_tree(config: Config, root_dir: Path, lines: list[str], indent_offset: 
         match parsed_node:
             case DirNode() as node:
                 node.parent = parent
+                node.line_no = line_idx + 1
                 parent.children.append(node)
                 prev_node = node
 
             case NewNode() as new_node:
                 node = tree.lookup_or_create(parent.filepath() / new_node.name, new_node.kind)
+                node.line_no = line_idx + 1
                 prev_node = node
 
     return tree

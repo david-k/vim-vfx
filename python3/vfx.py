@@ -92,6 +92,13 @@ def on_exit(s: Session):
     del SESSIONS[s.buf_no]
 
 
+def change_dir(s: Session, new_dir: Path):
+    s.view.cd(new_dir)
+    new_name = make_buf_name(str(s.view.root_dir()))
+    rename_nonfile_buffer(vim.current.buffer, new_name)
+    vim.eval(f'chdir( {escape_for_vim_expr(str(s.view.root_dir()))} )')
+
+
 def restore_alternate_buf(s: Session):
     if int(vim.eval(f"buflisted({s.alternate_buf})")):
         vim.command(f"let @# = {s.alternate_buf}")
@@ -418,6 +425,7 @@ class NodeChangeInfo:
     explicitly_removed: bool = False
     # So we know that we don't need to generate explicit REMOVE operations if the parent is already being removed
     implicitly_removed_by: Optional[NodeID] = None
+    removed_line_no: Optional[int] = None
 
 
 class NodeChanges:
@@ -440,9 +448,11 @@ class NodeChanges:
         else:
             raise Exception(f"Invalid node id: {new_node.id}")
 
-    def node_removed(self, old_node: DirNode):
+    def node_removed(self, old_node: DirNode, line_no: Optional[int] = None):
         change_info = self._get_changes_for_existing_node(old_node)
         change_info.explicitly_removed = True
+        if line_no is not None:
+            change_info.removed_line_no = line_no
         self._mark_nodes_implicitly_removed(old_node.children, old_node.id)
 
     def _mark_nodes_implicitly_removed(self, old_nodes: list[DirNode], implicitly_removed_by: NodeID):
@@ -489,6 +499,7 @@ def _compute_node_changes(
         # If the new node ID existed previously we need to detemine if anything has changed
         if old_node := old_nodes_by_id.get(new_node_id):
             old_node_removed = True
+            old_node_line_no = None
             for new_node in new_nodes_with_same_id:
                 if new_node.kind != old_node.kind:
                     raise Exception("TODO Changing node kind not supported yet")
@@ -501,11 +512,14 @@ def _compute_node_changes(
                 else:
                     node_changes.node_new_occurrence(new_node)
 
+                if _have_equivalent_parents(new_node, old_node):
+                    old_node_line_no = new_node.line_no
+
                 if new_node.is_dir():
                     _compute_node_changes(old_node.children, new_node.children, node_changes)
 
             if old_node_removed:
-                node_changes.node_removed(old_node)
+                node_changes.node_removed(old_node, old_node_line_no)
         else:
             _add_new_occurrences_recursively(new_nodes_with_same_id, node_changes)
 
@@ -538,6 +552,18 @@ def _nodes_by_id(node: DirNode) -> dict[NodeID, DirNode]:
     return nodes_out
 
 
+def _have_equivalent_parents(a: DirNode, b: DirNode) -> bool:
+    if a.parent is None or b.parent is None:
+        return a.parent == b.parent
+
+    # Do they both have root as their parent?
+    # (Root node IDs are not parsed and so are always different)
+    if a.parent.parent is None:
+        return b.parent.parent is None
+
+    return a.parent.id == b.parent.id
+
+
 # Filesystem operations
 #-----------------------------------------------------------
 def compute_operations(node_changes: NodeChanges) -> list[dict]:
@@ -545,18 +571,18 @@ def compute_operations(node_changes: NodeChanges) -> list[dict]:
     for change in node_changes.changes.values():
         if change.old_node is None:
             for new_node in change.new_occurrences:
-                operations.append({"kind": "NEW", "node": new_node})
+                operations.append({"kind": "NEW", "node": new_node, "line_no": new_node.line_no})
         else:
             if change.explicitly_removed:
                 if len(change.new_occurrences) == 1:
-                    operations.append({"kind": "MOVE", "old_node": change.old_node, "new_node": change.new_occurrences[0]})
+                    operations.append({"kind": "MOVE", "old_node": change.old_node, "new_node": change.new_occurrences[0], "line_no": change.new_occurrences[0].line_no})
                 else:
                     for new_node in change.new_occurrences:
-                        operations.append({"kind": "COPY", "old_node": change.old_node, "new_node": new_node})
-                    operations.append({"kind": "REMOVE", "node": change.old_node})
+                        operations.append({"kind": "COPY", "old_node": change.old_node, "new_node": new_node, "line_no": new_node.line_no})
+                    operations.append({"kind": "REMOVE", "node": change.old_node, "line_no": change.removed_line_no})
             else:
                 for new_node in change.new_occurrences:
-                    operations.append({"kind": "COPY", "old_node": change.old_node, "new_node": new_node})
+                    operations.append({"kind": "COPY", "old_node": change.old_node, "new_node": new_node, "line_no": new_node.line_no})
 
     return operations
 
@@ -568,9 +594,7 @@ def compute_operations(node_changes: NodeChanges) -> list[dict]:
 def init():
     global SESSIONS, GLOBAL_TREE_STATE
 
-    if not GLOBAL_TREE_STATE.root_dir:
-        GLOBAL_TREE_STATE.root_dir = Path.cwd()
-
+    GLOBAL_TREE_STATE.root_dir = Path.cwd()
     buf_name = make_buf_name(str(GLOBAL_TREE_STATE.root_dir))
 
     # The directory buffer should have no influence on the alternative file.
@@ -614,6 +638,9 @@ def init():
         )
     )
 
+    vim.eval(f'prop_type_add("vfx_change", {{"bufnr": {buf_no}, "highlight": "Changed"}})')
+    vim.eval(f'prop_type_add("vfx_remove", {{"bufnr": {buf_no}, "highlight": "Removed"}})')
+
     update_buffer()
     vim_set_line_no(GLOBAL_TREE_STATE.cursor_line)
     vim_set_column_no(GLOBAL_TREE_STATE.cursor_column)
@@ -621,7 +648,6 @@ def init():
 
 def quit():
     s = get_session(); assert s
-    on_exit(s)
 
     # Since we have set bufhidden=wipe, quitting is done by simply switching
     # to another buffer (to the alternative buffer in this case)
@@ -647,15 +673,11 @@ def open_entry():
     s = get_session(); assert s
     filepath = s.view.root_dir() / get_path_at(vim_get_line_no(), s.indent_offset)
     if filepath.is_dir():
-        s.view.cd(filepath)
+        change_dir(s, filepath)
         update_buffer()
-
-        new_name = make_buf_name(str(s.view.root_dir()))
-        rename_nonfile_buffer(vim.current.buffer, new_name)
     else:
         default_app = default_app_for(filepath)
         if should_open_in_vim(default_app):
-            on_exit(s)
             vim.command("keepalt edit " + escape_fn_for_vim_cmd(str(filepath)))
         else:
             subprocess.Popen(["xdg-open", filepath], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -677,11 +699,10 @@ def move_up():
         return
 
     s = get_session(); assert s
-    if s.view.move_up():
+    root_dir = s.view.root_dir()
+    if root_dir.parent != root_dir:
+        change_dir(s, root_dir.parent)
         update_buffer()
-
-        new_name = make_buf_name(str(s.view.root_dir()))
-        rename_nonfile_buffer(vim.current.buffer, new_name)
 
 
 def toggle_dotfiles():
@@ -800,6 +821,41 @@ def on_buf_save():
 
             s.view.refresh_from_fs()
             update_buffer()
+
+
+def display_changes():
+    def add_text_prop(line_no, text, style, align = "after"):
+        if align == "after":
+            text = "    " + text
+        else:
+            text += "\n"
+        vim.eval(f'prop_add({line_no}, 0, {{"type": "{style}", "text": {escape_for_vim_expr(text)}, "text_align": "{align}"}})')
+
+    # TODO Use b:changetick to only recompute the changes if the buffer has changed
+
+    s = get_session(); assert s
+    node_changes = compute_node_changes(s.view, vim.current.buffer, s.indent_offset)
+    operations = compute_operations(node_changes)
+    vim.eval('prop_clear(1, line("$"))')
+    for op in operations:
+        if op["kind"] == "NEW":
+            cmd = "MKDIR" if op['node'].is_dir() else "TOUCH"
+            add_text_prop(op["node"].line_no, f"{cmd} {op['node'].filepath_str()}", style="vfx_change")
+        elif op["kind"] == "REMOVE":
+            cmd = "REMOVE-REC" if op['node'].is_dir() else "REMOVE"
+            text = f"{cmd} {op['node'].filepath_str()}"
+            if op["line_no"] is None:
+                add_text_prop(1, text, align="above", style="vfx_remove")
+            else:
+                add_text_prop(op["line_no"], text, style="vfx_remove")
+        elif op["kind"] == "COPY":
+            cmd = "COPY-REC" if op['old_node'].is_dir() else "COPY"
+            add_text_prop(op["line_no"], f"COPY {op['old_node'].filepath_str()} -> {op['new_node'].filepath_str()}", style="vfx_change")
+        elif op["kind"] == "MOVE":
+            add_text_prop(op["line_no"], f"MOVE {op['old_node'].filepath_str()} -> {op['new_node'].filepath_str()}", style="vfx_change")
+        else:
+            raise Exception("Unsupported op: " + op["kind"])
+
 
 
 # For internal use. Called when the BufUnload autocmd event is fired.

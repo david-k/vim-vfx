@@ -22,6 +22,10 @@ EOF
 
 	autocmd BufUnload <buffer> py3 vfx.on_buf_unload()
 	autocmd BufWriteCmd <buffer> py3 vfx.on_buf_save()
+	autocmd InsertLeave <buffer> py3 vfx.display_changes()
+	autocmd TextChanged <buffer> py3 vfx.display_changes()
+
+	" TODO Define `autocmd FileExplorer`. This makes it possible to do `:edit <DIRECTORY>` like netrw
 
 	setl conceallevel=2
 	setl concealcursor=nvic

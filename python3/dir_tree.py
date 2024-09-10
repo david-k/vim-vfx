@@ -50,6 +50,8 @@ class DirNode:
     is_expanded: bool = False
     children: list["DirNode"] = field(default_factory=list)
 
+    line_no: Optional[int] = None
+
     def is_dir(self) -> bool:
         return self.kind == NodeKind.DIRECTORY
 
