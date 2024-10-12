@@ -92,11 +92,12 @@ def on_exit(s: Session):
     del SESSIONS[s.buf_no]
 
 
-def change_dir(s: Session, new_dir: Path):
+def change_dir(s: Session, new_dir: Path, update_pwd: bool = False):
     s.view.cd(new_dir)
     new_name = make_buf_name(str(s.view.root_dir()))
     rename_nonfile_buffer(vim.current.buffer, new_name)
-    vim.eval(f'chdir( {escape_for_vim_expr(str(s.view.root_dir()))} )')
+    if update_pwd:
+        vim.eval(f'chdir( {escape_for_vim_expr(str(s.view.root_dir()))} )')
 
 
 def restore_alternate_buf(s: Session):
@@ -697,6 +698,8 @@ def move_up():
     if is_buf_modified():
         print("There are unsaved changes")
         return
+
+    # TODO[Bug] When moving up and then closing vfx, you are presented with a new, empty buffer instead of switching back to the alt buffer
 
     s = get_session(); assert s
     root_dir = s.view.root_dir()
