@@ -593,6 +593,22 @@ def compute_operations(node_changes: NodeChanges) -> list[dict]:
     return operations
 
 
+def op_to_str(op: dict) -> str:
+    if op["kind"] == "NEW":
+        cmd = "MKDIR" if op['node'].is_dir() else "TOUCH"
+        return f"{cmd} {op['node'].filepath_str()}"
+    elif op["kind"] == "REMOVE":
+        cmd = "REMOVE-REC" if op['node'].is_dir() else "REMOVE"
+        return f"{cmd} {op['node'].filepath_str()}"
+    elif op["kind"] == "COPY":
+        cmd = "COPY-REC" if op['old_node'].is_dir() else "COPY"
+        return f"COPY {op['old_node'].filepath_str()} -> {op['new_node'].filepath_str()}"
+    elif op["kind"] == "MOVE":
+        return f"MOVE {op['old_node'].filepath_str()} -> {op['new_node'].filepath_str()}"
+    else:
+        raise Exception("Unsupported op: " + op["kind"])
+
+
 
 # Functions that are called from Vim
 #===============================================================================
@@ -772,23 +788,15 @@ def on_buf_save():
             vim.command("setl nomodified") # Don't mark the buffer as modified
             return
 
-        for op in operations:
-            if op["kind"] == "NEW":
-                cmd = "MKDIR" if op['node'].is_dir() else "TOUCH"
-                print(f"{cmd} {op['node'].filepath_str()}")
-            elif op["kind"] == "REMOVE":
-                cmd = "REMOVE-REC" if op['node'].is_dir() else "REMOVE"
-                print(f"{cmd} {op['node'].filepath_str()}")
-            elif op["kind"] == "COPY":
-                cmd = "COPY-REC" if op['old_node'].is_dir() else "COPY"
-                print(f"COPY {op['old_node'].filepath_str()} -> {op['new_node'].filepath_str()}")
-            elif op["kind"] == "MOVE":
-                print(f"MOVE {op['old_node'].filepath_str()} -> {op['new_node'].filepath_str()}")
-            else:
-                raise Exception("Unsupported op: " + op["kind"])
+        apply_changes = True
+        if CONFIG.confirm_changes:
+            for op in operations:
+                print(op_to_str(op))
 
-        choice = int(vim.eval('confirm("Apply changes?", "yes\nno", 2)'))
-        if choice == 1:
+            choice = int(vim.eval('confirm("Apply changes?", "yes\nno", 2)'))
+            apply_changes = choice == 1
+
+        if apply_changes:
             buffers_by_name = {buf.name: buf for buf in vim.buffers if buf.valid}
             for op in operations:
                 if op["kind"] == "NEW":
@@ -828,6 +836,8 @@ def on_buf_save():
                         print("Aborting")
                         return
                     else:
+                        # TODO When renaming a directory, we need to rename all open child buffers
+
                         # For the lookup to work old_filepath needs to denote an absolute path
                         buffer = buffers_by_name.get(str(old_filepath))
                         if buffer is None:
@@ -859,20 +869,16 @@ def display_changes():
     vim.eval('prop_clear(1, line("$"))')
     for op in operations:
         if op["kind"] == "NEW":
-            cmd = "MKDIR" if op['node'].is_dir() else "TOUCH"
-            add_text_prop(op["node"].line_no, f"{cmd} {op['node'].filepath_str()}", style="vfx_change")
+            add_text_prop(op["node"].line_no, op_to_str(op), style="vfx_change")
         elif op["kind"] == "REMOVE":
-            cmd = "REMOVE-REC" if op['node'].is_dir() else "REMOVE"
-            text = f"{cmd} {op['node'].filepath_str()}"
             if op["line_no"] is None:
-                add_text_prop(1, text, align="above", style="vfx_remove")
+                add_text_prop(1, op_to_str(op), align="above", style="vfx_remove")
             else:
-                add_text_prop(op["line_no"], text, style="vfx_remove")
+                add_text_prop(op["line_no"], op_to_str(op), style="vfx_remove")
         elif op["kind"] == "COPY":
-            cmd = "COPY-REC" if op['old_node'].is_dir() else "COPY"
-            add_text_prop(op["line_no"], f"COPY {op['old_node'].filepath_str()} -> {op['new_node'].filepath_str()}", style="vfx_change")
+            add_text_prop(op["line_no"], op_to_str(op), style="vfx_change")
         elif op["kind"] == "MOVE":
-            add_text_prop(op["line_no"], f"MOVE {op['old_node'].filepath_str()} -> {op['new_node'].filepath_str()}", style="vfx_change")
+            add_text_prop(op["line_no"], op_to_str(op), style="vfx_change")
         else:
             raise Exception("Unsupported op: " + op["kind"])
 

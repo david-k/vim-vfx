@@ -10,6 +10,7 @@ class NodeState(Enum):
 
 @dataclass
 class Config:
+    confirm_changes: bool
     indent_width: int
     node_state_symbols: dict[NodeState, str]
     node_state_symbol_width: int
@@ -17,6 +18,7 @@ class Config:
 
 def default_config() -> Config:
     return Config(
+        confirm_changes = False,
         indent_width = 4,
 
         node_state_symbols = {
