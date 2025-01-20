@@ -97,7 +97,7 @@ def change_dir(s: Session, new_dir: Path, update_pwd: bool = False):
     new_name = make_buf_name(str(s.view.root_dir()))
     rename_nonfile_buffer(vim.current.buffer, new_name)
     if update_pwd:
-        vim.eval(f'chdir( {escape_for_vim_expr(str(s.view.root_dir()))} )')
+        vim_cd(s.view.root_dir())
 
 
 def restore_alternate_buf(s: Session):
@@ -122,7 +122,8 @@ def default_app_for(filename: Path) -> str:
 
 
 def should_open_in_vim(default_app: str) -> bool:
-    return default_app in ["", "vim.desktop", "gvim.desktop"]
+    # Maybe just open all MIME types matching text/* in vim
+    return default_app in ["", "vim.desktop", "gvim.desktop", "emacs.desktop"]
 
 
 def is_dir_empty(path: Path) -> bool:
@@ -173,6 +174,10 @@ def vim_set_column_no(col: int):
         vim.command(f'normal 0{col-1}l')
     else:
         vim.command(f'normal 0')
+
+
+def vim_cd(path: Path):
+    vim.eval(f'chdir( {escape_for_vim_expr(str(path))} )')
 
 
 def is_buf_name_available(buf_name: str) -> bool:
@@ -228,8 +233,8 @@ def move_file(vim_buffer, new_filepath: Path):
     # - However, when writing a new file with :saveas or :write, file
     #   permissions are not preserved. Thus, we move the original file to its
     #   intended destination -- ensuring that all file attributes are preserved
-    #   -- even though we then immediatly overwrite it with the contents of then
-    #   buffer.
+    #   -- even though we then immediatly overwrite it with the contents of the
+    #   new buffer.
     #
     # This means that moving a file that is connected to a Vim buffer will
     # always save the buffer to disk. I don't quite like it, but this seems to
@@ -595,7 +600,8 @@ def compute_operations(node_changes: NodeChanges) -> list[dict]:
 def init():
     global SESSIONS, GLOBAL_TREE_STATE
 
-    GLOBAL_TREE_STATE.root_dir = Path.cwd()
+    if GLOBAL_TREE_STATE.root_dir is None:
+        GLOBAL_TREE_STATE.root_dir = Path.cwd()
     buf_name = make_buf_name(str(GLOBAL_TREE_STATE.root_dir))
 
     # The directory buffer should have no influence on the alternative file.
@@ -682,6 +688,17 @@ def open_entry():
             vim.command("keepalt edit " + escape_fn_for_vim_cmd(str(filepath)))
         else:
             subprocess.Popen(["xdg-open", filepath], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def open_vim_cwd():
+    s = get_session(); assert s
+    change_dir(s, vim.eval("getcwd()"))
+    update_buffer()
+
+
+def change_vim_cwd():
+    s = get_session(); assert s
+    vim_cd(s.view.root_dir())
 
 
 def toggle_expand():

@@ -14,6 +14,8 @@ EOF
 
 	nnoremap <buffer> <CR> :py3 vfx.open_entry()<CR>
 	nnoremap <buffer> <Backspace> :py3 vfx.move_up()<CR>
+	nnoremap <buffer> _ :py3 vfx.open_vim_cwd()<CR>
+	nnoremap <buffer> ´ :py3 vfx.change_vim_cwd()<CR>
 	nnoremap <buffer> g. :py3 vfx.toggle_dotfiles()<CR>
 	nnoremap <buffer> gl :py3 vfx.toggle_details()<CR>
 	nnoremap <buffer> <Tab> :py3 vfx.toggle_expand()<CR>
