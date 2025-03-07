@@ -5,10 +5,10 @@
 syntax match VfxLeadingSpace "^[ \t]*" nextgroup=VfxID,VfxAdded
 syntax region VfxDetails start="^\[" end="\][ \t]*" nextgroup=VfxID
 
-syntax match VfxID "|[0-9]\+:[0-9]\+_" contained conceal cchar=|
-syntax match VfxID "|[0-9]\+:[0-9]\+x" contained conceal cchar=| nextgroup=VfxExecutable
-syntax match VfxID "+[0-9]\+:[0-9]\+_" contained conceal cchar=+ nextgroup=VfxDirectory
-syntax match VfxID "-[0-9]\+:[0-9]\+_" contained conceal cchar=- nextgroup=VfxDirectory
+syntax match VfxID "|[0-9]\+_" contained conceal cchar=|
+syntax match VfxID "|[0-9]\+x" contained conceal cchar=| nextgroup=VfxExecutable
+syntax match VfxID "+[0-9]\+_" contained conceal cchar=+ nextgroup=VfxDirectory
+syntax match VfxID "-[0-9]\+_" contained conceal cchar=- nextgroup=VfxDirectory
 
 " Matches directory entries (those that end with '/').
 " In the search pattern below, \{-1,} denotes non-greedy repetition (with at
@@ -26,7 +26,12 @@ syntax match VfxUnknownLink " ->?"
 " Matches new entries without a leading ID
 syntax match VfxAdded "[^\[|+\- \t].*" contained
 
+" '\%1' matches only the first line
+syntax region VfxOptions start="\%1l^>" end="|" conceal cchar=> nextgroup=VfxRootDir
+syntax match VfxRootDir ".*" contained
 
+
+highlight def link VfxRootDir SpellRare
 highlight def link VfxDirectory Directory
 highlight def link VfxExecutable Type
 highlight def link VfxDetails Comment

@@ -20,38 +20,64 @@ from typing import (
 )
 
 from config import Config, default_config
-from dir_tree import (
-    DirTree,
-    DirView,
-    DirNode,
-    NodeKind,
-    LinkStatus,
-    NodeID,
-)
+from dir_tree import *
 from dir_parser import (
     parse_line,
-    parse_tree,
-    compute_indent,
+    parse_buffer,
     NODE_FLAGS_LEN,
+    EntryOffset,
 )
+
+
+# TODO Test edge case: Changing a directory to a file with the same name (and vice versa)
+
+# TODO Use listener_add() to listen for changes to the buffer so we don't need to reparse everything
 
 
 # Global state
 #===============================================================================
-BufNo = NewType("BufNo", int)
-
 @dataclass
 class Session:
-    buf_no: BufNo
-    alternate_buf: BufNo
-    view: DirView
-    indent_offset: int = 0
+    buf_no: int
+    alternate_buf: int
+    replaced_buf: int
+    base_tree: DirTree
+    cur_path: Path
+    changedtick: int
+    path_info: PathInfoNode
+    mods_by_id: dict[NodeIDKnown, Modification] = field(default_factory=dict)
+
+
+def vim_changetick() -> int:
+    return int(vim.eval("b:changedtick"))
+
+
+def update_session_from_buf(s: Session) -> Optional[DirTree]:
+    changedtick = vim_changetick()
+    if s.changedtick != changedtick:
+        buf_tree = parse_buffer(CONFIG, vim.current.buffer)
+        s.path_info.set_node(buf_tree.root_dir(), get_expanded_dirs_for_node(buf_tree.root))
+        update_base_tree_from_buf(s.base_tree, buf_tree, s.path_info, error_callback=print_error)
+        if buf_tree.root_dir() != s.cur_path:
+            change_dir(s, buf_tree.root_dir())
+
+        s.changedtick = changedtick
+        return buf_tree
+
+    return None
+
+
+def update_session_from_buf__return_tree(s: Session) -> DirTree:
+    if buf_tree := update_session_from_buf(s):
+        return buf_tree
+
+    return parse_buffer(CONFIG, vim.current.buffer)
 
 
 @dataclass
 class GlobalTreeState:
     root_dir: Optional[Path] = None
-    expanded_dirs: set[Path] = field(default_factory=set)
+    path_info: PathInfoNode = field(default_factory=PathInfoNode)
     show_dotfiles: bool = False
     show_details: bool = True
     cursor_line: int = 1
@@ -60,21 +86,13 @@ class GlobalTreeState:
 
 CONFIG = default_config()
 GLOBAL_TREE_STATE = GlobalTreeState()
-LAST_GEN_ID = 0
 SESSIONS: dict[int, Session] = {}
 
 
 # Utils
 #===============================================================================
-def next_gen_id() -> int:
-    global LAST_GEN_ID
-
-    LAST_GEN_ID += 1
-    return LAST_GEN_ID
-
-
 def get_session() -> Optional[Session]:
-    buf_no = BufNo(vim.current.buffer.number)
+    buf_no = int(vim.current.buffer.number)
     return SESSIONS.get(buf_no)
 
 
@@ -82,10 +100,10 @@ def get_session() -> Optional[Session]:
 def on_exit(s: Session):
     global GLOBAL_TREE_STATE
 
-    GLOBAL_TREE_STATE.root_dir = s.view.root_dir()
-    GLOBAL_TREE_STATE.expanded_dirs = s.view.expanded_dirs
-    GLOBAL_TREE_STATE.show_dotfiles = s.view.show_dotfiles
-    GLOBAL_TREE_STATE.show_details = s.view.show_details
+    GLOBAL_TREE_STATE.root_dir = s.cur_path
+    GLOBAL_TREE_STATE.path_info = s.path_info.clone()
+    GLOBAL_TREE_STATE.show_dotfiles = s.base_tree.has_dotfiles
+    GLOBAL_TREE_STATE.show_details = s.base_tree.has_details
     GLOBAL_TREE_STATE.cursor_line = vim_get_line_no()
     GLOBAL_TREE_STATE.cursor_column = vim_get_column_no()
 
@@ -93,11 +111,27 @@ def on_exit(s: Session):
 
 
 def change_dir(s: Session, new_dir: Path, update_pwd: bool = False):
-    s.view.cd(new_dir)
-    new_name = make_buf_name(str(s.view.root_dir()))
+    assert new_dir.is_absolute()
+
+    # Add new_dir to base_tree
+    new_dir = new_dir.resolve()
+    s.base_tree.add_path(new_dir)
+    s.cur_path = new_dir
+    s.path_info.set_expanded(new_dir, True)
+
+    # Refresh base_tree
+    refresh_node(
+        s.base_tree,
+        s.base_tree.lookup(s.cur_path),
+        path_info = s.path_info.lookup_or_create(s.cur_path),
+        refresh = False,
+        error_callback = print_error,
+    )
+
+    new_name = make_buf_name(str(s.cur_path))
     rename_nonfile_buffer(vim.current.buffer, new_name)
     if update_pwd:
-        vim_cd(s.view.root_dir())
+        vim_cd(s.cur_path)
 
 
 def restore_alternate_buf(s: Session):
@@ -133,14 +167,34 @@ def is_dir_empty(path: Path) -> bool:
     return True
 
 
+def update_buffer(tree: DirTree):
+    s = get_session(); assert s
+    was_modified = is_buf_modified()
+
+    with io.StringIO() as buf:
+        indent_offset = write_tree(CONFIG, buf, tree, tree.lookup(s.cur_path), s.path_info.try_lookup(s.cur_path))
+        buf.seek(0, io.SEEK_SET)
+        vim_set_buffer_contents(buf.readlines())
+
+        s.changedtick = vim_changetick()
+
+        first_tab_stop = indent_offset + CONFIG.node_state_symbol_width + 1 # +1 for the space following the node state symbol
+        vim.command(f"setl varsofttabstop={first_tab_stop},{CONFIG.indent_width}")
+        # There is also 'vartabstop' in case I want to support tabs for indentation
+
+    if not was_modified:
+        vim.command("setl nomodified")
+
+def print_error(msg: str):
+    vim.command(f"echohl ErrorMsg | echo { escape_for_vim_expr('Error: ' + msg) } | echohl None")
+
+
 # Vim helpers
 #-----------------------------------------------------------
 def escape_for_vim_expr(text: str):
     return "'" + text.replace("'", "''") + "'"
 
 def escape_fn_for_vim_cmd(text: str):
-    #return re.sub(r'(\n| |\t|\r|\\)', r'\\\1', text)
-
     esc = vim.eval(f'fnameescape( {escape_for_vim_expr(text)} )')
     if esc == "" and text != "":
         raise Exception("fnameescape() failed")
@@ -222,7 +276,7 @@ def move_file(vim_buffer, new_filepath: Path):
     # After having renamed the buffer with the above call to
     # `rename_nonfile_buffer()` we still need to do the following:
     #
-    # 1. Moving the actual file
+    # 1. Move the actual file
     # 2. Write the renamed buffer to disk, overwriting the moved file from the first step.
     #
     # The second step may seem redundant, but here are the reasons:
@@ -233,8 +287,8 @@ def move_file(vim_buffer, new_filepath: Path):
     # - However, when writing a new file with :saveas or :write, file
     #   permissions are not preserved. Thus, we move the original file to its
     #   intended destination -- ensuring that all file attributes are preserved
-    #   -- even though we then immediatly overwrite it with the contents of the
-    #   new buffer.
+    #   -- and then immediatly overwrite it with the contents of the new
+    #   buffer.
     #
     # This means that moving a file that is connected to a Vim buffer will
     # always save the buffer to disk. I don't quite like it, but this seems to
@@ -259,355 +313,48 @@ def is_buf_modified() -> bool:
     return bool(int(vim.eval("&modified")))
 
 
+def add_text_prop(line_no: int, text: str, style: str, align: str = "after"):
+    if align == "after":
+        text = "    " + text
+    else:
+        text += "\n"
+    vim.eval(f'prop_add({line_no}, 0, {{"type": "{style}", "text": {escape_for_vim_expr(text)}, "text_align": "{align}"}})')
+
+
 # Working with filepaths in the buffer
 #-----------------------------------------------------------
-def get_path_at(line_no: int, indent_offset: int) -> Path:
+def get_path_at(line_no: int) -> Path:
     parts = [get_name_at(vim_get_line(line_no))]
-    while line_no := go_to_parent(line_no, indent_offset):
+    while line_no := go_to_parent(line_no):
         parts.append(get_name_at(vim_get_line(line_no)))
 
     head, *tail = reversed(parts)
     return Path(head).joinpath(*tail)
 
 
-def go_to_parent(line_no: int, indent_offset: int) -> int:
-    cur_indent = get_indent_at(line_no, indent_offset)
-    for cur_line_no in range(line_no - 1, 0, -1):
-        if get_indent_at(cur_line_no, indent_offset) < cur_indent:
+def go_to_parent(line_no: int) -> int:
+    cur_offset = get_indent_at(line_no)
+    for cur_line_no in range(line_no - 1, NUM_LINES_BEFORE_TREE, -1):
+        next_offset = get_indent_at(cur_line_no)
+        indent_diff = (next_offset.diff(cur_offset) / CONFIG.indent_width)
+        if indent_diff < 0:
             return cur_line_no
 
     return 0
 
 
-def get_indent_at(line_no: int, indent_offset: int) -> int:
+def get_indent_at(line_no: int) -> EntryOffset:
     line = vim_get_line(line_no)
     if not line:
-        return 0
+        return EntryOffset()
 
     _, segments = parse_line(CONFIG, line)
-    return compute_indent(CONFIG, segments, indent_offset)
+    return EntryOffset.from_segments(segments, CONFIG)
 
 
 def get_name_at(line: str) -> str:
     node, _ = parse_line(CONFIG, line)
     return node.name
-
-
-# Printing
-#-----------------------------------------------------------
-NUM_DETAIL_COLUMNS = 5
-
-def print_entries(entries: list[DirNode], max_id_width: int = 6):
-    column_widths = [0] * (NUM_DETAIL_COLUMNS + 1)
-    column_widths[-1] = max_id_width
-
-    with io.StringIO() as buf:
-        write_entries(buf, entries, column_widths)
-        buf.seek(0, io.SEEK_SET)
-        print(buf.getvalue())
-
-
-def write_tree(out: TextIO, view: DirView) -> int:
-    column_widths = [0] * (NUM_DETAIL_COLUMNS + 1)
-    column_widths[-1] = len(str(view.tree.last_entry_id))
-
-    details_width = 0
-    root_nodes = view.tree.root.children
-    if root_nodes and root_nodes[0].details is not None:
-        compute_column_widths(root_nodes, column_widths)
-
-        for i in range(NUM_DETAIL_COLUMNS):
-            details_width += column_widths[i]
-        details_width += (NUM_DETAIL_COLUMNS-1) # Spaces between columns
-        details_width += 2 # Opening and closing brackets
-        details_width += 1 # Space after closing bracket
-
-    write_entries(out, view.tree.root.children, column_widths)
-    return details_width
-
-
-def write_entries(out: TextIO, entries: list[DirNode], column_widths: list[int], indent: int = 0):
-    max_id_width = column_widths[-1]
-    for entry in entries:
-        if entry.details is not None:
-            d = entry.details
-            c1_width = column_widths[0]
-            c2_width = column_widths[1]
-            c3_width = column_widths[2]
-            c4_width = column_widths[3]
-            c5_width = column_widths[4]
-            # ATTENTION: This must be kept in sync with the computation of `details_width` in `write_tree()` and with `compute_column_widths()`
-            out.write(f"[{d.mode:<{c1_width}} {d.user:<{c2_width}} {d.group:<{c3_width}} {d.size:>{c4_width}} {d.mtime:<{c5_width}}] ")
-
-        out.write(indent * CONFIG.indent_width * " ")
-
-        node_state = "|"
-        if entry.is_dir():
-            if entry.is_expanded:
-                node_state = "-"
-            else:
-                node_state = "+"
-
-        out.write(f"{node_state}{entry.id[0]}:{entry.id[1]:0{max_id_width}}") # TODO Also need a max_width for gen id
-        if entry.is_executable:
-            out.write("x")
-        else:
-            out.write("_")
-
-        out.write(" " + escape_if_needed(str(entry.name)))
-        if entry.kind == NodeKind.DIRECTORY:
-            out.write("/")
-
-        if entry.link_status != LinkStatus.NO_LINK:
-            status = ""
-            if entry.link_status == LinkStatus.BROKEN:
-                status = "!"
-            elif entry.link_status == LinkStatus.UNKNOWN:
-                status = "?"
-
-            out.write(f" ->{status}")
-            if entry.link_target is not None:
-                out.write(f" {entry.link_target}")
-
-                if entry.kind == NodeKind.DIRECTORY and entry.link_target.name != "": # Root dir has no name
-                    out.write("/")
-
-        out.write("\n")
-        if len(entry.children):
-            write_entries(out, entry.children, column_widths, indent + 1)
-
-
-def compute_column_widths(nodes: list[DirNode], widths: list[int]):
-    for node in nodes:
-        if node.details is None:
-            return
-
-        widths[0] = max(widths[0], len(node.details.mode))
-        widths[1] = max(widths[1], len(node.details.user))
-        widths[2] = max(widths[2], len(node.details.group))
-        widths[3] = max(widths[3], len(node.details.size))
-        widths[4] = max(widths[3], len(node.details.mtime))
-
-        if node.is_dir():
-            compute_column_widths(node.children, widths)
-
-
-def escape_if_needed(filename: str) -> str:
-    if needs_escaping(filename):
-        return escape_filename(filename)
-
-    return filename
-
-
-def needs_escaping(filename: str) -> bool:
-    if filename.find("\n") != -1:
-        return True
-
-    return filename[0].isspace() or filename[-1].isspace()
-
-
-def escape_filename(filename: str) -> str:
-    escaped = filename.replace('\\', '\\\\').replace("'", "\\'").replace('"', '\\"').replace('\n', '\\n')
-    return "'" + escaped + "'"
-
-
-def unescape_filename(filename: str) -> str:
-    if filename[0] == "'":
-        if filename[-1] != "'":
-            raise Exception("Missing closing quote in filename: " + filename)
-
-        filename = filename[1:-1]
-        filename = filename.replace('\\n', '\n').replace('\\"', '"').replace("\\'", "'").replace('\\\\', '\\')
-
-    return filename
-
-
-# Compute node changes
-#-----------------------------------------------------------
-@dataclass
-class NodeChangeInfo:
-    old_node: Optional[DirNode] = None
-    new_occurrences: list[DirNode] = field(default_factory=list)
-    explicitly_removed: bool = False
-    # So we know that we don't need to generate explicit REMOVE operations if the parent is already being removed
-    implicitly_removed_by: Optional[NodeID] = None
-    removed_line_no: Optional[int] = None
-
-
-class NodeChanges:
-    old_nodes_by_id: dict[NodeID, DirNode]
-    changes: dict[NodeID, NodeChangeInfo]
-
-    def __init__(self, old_nodes_by_id: dict[NodeID, DirNode]):
-        self.old_nodes_by_id = old_nodes_by_id
-        self.changes = {}
-
-    def node_new_occurrence(self, new_node: DirNode):
-        # Is this is a new entry?
-        if new_node.id[0] == -1:
-            change_info = self._get_changes_for_new_node(new_node)
-            change_info.new_occurrences.append(new_node)
-        # Or is this an existing entry, possibly modified?
-        elif old_node := self.old_nodes_by_id.get(new_node.id):
-            change_info = self._get_changes_for_existing_node(old_node)
-            change_info.new_occurrences.append(new_node)
-        else:
-            raise Exception(f"Invalid node id: {new_node.id}")
-
-    def node_removed(self, old_node: DirNode, line_no: Optional[int] = None):
-        change_info = self._get_changes_for_existing_node(old_node)
-        change_info.explicitly_removed = True
-        if line_no is not None:
-            change_info.removed_line_no = line_no
-        self._mark_nodes_implicitly_removed(old_node.children, old_node.id)
-
-    def _mark_nodes_implicitly_removed(self, old_nodes: list[DirNode], implicitly_removed_by: NodeID):
-        for old_node in old_nodes:
-            change_info = self._get_changes_for_existing_node(old_node)
-            change_info.implicitly_removed_by = implicitly_removed_by
-            if old_node.is_dir():
-                self._mark_nodes_implicitly_removed(old_node.children, implicitly_removed_by)
-
-    def _get_changes_for_existing_node(self, old_node: DirNode) -> NodeChangeInfo:
-        change_info = self.changes.setdefault(old_node.id, NodeChangeInfo(old_node=old_node))
-        assert change_info.old_node is old_node
-        return change_info
-
-    def _get_changes_for_new_node(self, new_node: DirNode) -> NodeChangeInfo:
-        change_info = self.changes.setdefault(new_node.id, NodeChangeInfo())
-        assert change_info.old_node is None
-        assert not change_info.explicitly_removed
-        return change_info
-
-
-def compute_node_changes(view: DirView, lines: list[str], indent_offset: int) -> NodeChanges:
-    node_changes = NodeChanges(_nodes_by_id(view.tree.root))
-    buf_tree = parse_tree(CONFIG, view.root_dir(), lines, indent_offset)
-    _compute_node_changes(view.tree.root.children, buf_tree.root.children, node_changes)
-    return node_changes
-
-
-def _compute_node_changes(
-    old_nodes: list[DirNode],
-    new_nodes: list[DirNode],
-    # Output:
-    node_changes: NodeChanges
-):
-    # For the old nodes, there is a one-to-one mapping between node IDs and nodes
-    old_nodes_by_id: dict[NodeID, DirNode] = {node.id:node for node in old_nodes}
-    # However, there may be multiple new nodes with the same ID (because of COPYing)
-    new_nodes_by_id: dict[NodeID, list[DirNode]] = {}
-    for new_node in new_nodes:
-        new_nodes_by_id.setdefault(new_node.id, []).append(new_node)
-
-    # Handle new and modified nodes
-    for (new_node_id, new_nodes_with_same_id) in new_nodes_by_id.items():
-        # If the new node ID existed previously we need to detemine if anything has changed
-        if old_node := old_nodes_by_id.get(new_node_id):
-            old_node_removed = True
-            old_node_line_no = None
-            for new_node in new_nodes_with_same_id:
-                if new_node.kind != old_node.kind:
-                    raise Exception("TODO Changing node kind not supported yet")
-
-                if new_node.link_target != old_node.link_target:
-                    raise Exception("TODO Changing link target is not supported yet")
-
-                if new_node.name == old_node.name:
-                    old_node_removed = False
-                else:
-                    node_changes.node_new_occurrence(new_node)
-
-                if _have_equivalent_parents(new_node, old_node):
-                    old_node_line_no = new_node.line_no
-
-                if new_node.is_dir():
-                    _compute_node_changes(old_node.children, new_node.children, node_changes)
-
-            if old_node_removed:
-                node_changes.node_removed(old_node, old_node_line_no)
-        else:
-            _add_new_occurrences_recursively(new_nodes_with_same_id, node_changes)
-
-    # Handle removed nodes
-    removed_node_ids = old_nodes_by_id.keys() - new_nodes_by_id.keys()
-    for removed_node_id in removed_node_ids:
-        node_changes.node_removed(old_nodes_by_id[removed_node_id])
-
-
-def _add_new_occurrences_recursively(new_nodes: list[DirNode], node_changes: NodeChanges) -> None:
-    for new_entry in new_nodes:
-        if new_entry.is_dir():
-            _add_new_occurrences_recursively(new_entry.children, node_changes)
-
-        node_changes.node_new_occurrence(new_entry)
-
-
-def _nodes_by_id(node: DirNode) -> dict[NodeID, DirNode]:
-    def _nodes_by_id_rec(
-        node: DirNode,
-        nodes_out: dict[NodeID, DirNode]
-    ):
-        for child in node.children:
-            nodes_out[child.id] = child
-            _nodes_by_id_rec(child, nodes_out)
-
-    nodes_out: dict[NodeID, DirNode] = {}
-    _nodes_by_id_rec(node, nodes_out)
-
-    return nodes_out
-
-
-def _have_equivalent_parents(a: DirNode, b: DirNode) -> bool:
-    if a.parent is None or b.parent is None:
-        return a.parent == b.parent
-
-    # Do they both have root as their parent?
-    # (Root node IDs are not parsed and so are always different)
-    if a.parent.parent is None:
-        return b.parent.parent is None
-
-    return a.parent.id == b.parent.id
-
-
-# Filesystem operations
-#-----------------------------------------------------------
-def compute_operations(node_changes: NodeChanges) -> list[dict]:
-    operations = []
-    for change in node_changes.changes.values():
-        if change.old_node is None:
-            for new_node in change.new_occurrences:
-                operations.append({"kind": "NEW", "node": new_node, "line_no": new_node.line_no})
-        else:
-            if change.explicitly_removed:
-                if len(change.new_occurrences) == 1:
-                    operations.append({"kind": "MOVE", "old_node": change.old_node, "new_node": change.new_occurrences[0], "line_no": change.new_occurrences[0].line_no})
-                else:
-                    for new_node in change.new_occurrences:
-                        operations.append({"kind": "COPY", "old_node": change.old_node, "new_node": new_node, "line_no": new_node.line_no})
-                    operations.append({"kind": "REMOVE", "node": change.old_node, "line_no": change.removed_line_no})
-            else:
-                for new_node in change.new_occurrences:
-                    operations.append({"kind": "COPY", "old_node": change.old_node, "new_node": new_node, "line_no": new_node.line_no})
-
-    return operations
-
-
-def op_to_str(op: dict) -> str:
-    if op["kind"] == "NEW":
-        cmd = "MKDIR" if op['node'].is_dir() else "TOUCH"
-        return f"{cmd} {op['node'].filepath_str()}"
-    elif op["kind"] == "REMOVE":
-        cmd = "REMOVE-REC" if op['node'].is_dir() else "REMOVE"
-        return f"{cmd} {op['node'].filepath_str()}"
-    elif op["kind"] == "COPY":
-        cmd = "COPY-REC" if op['old_node'].is_dir() else "COPY"
-        return f"COPY {op['old_node'].filepath_str()} -> {op['new_node'].filepath_str()}"
-    elif op["kind"] == "MOVE":
-        return f"MOVE {op['old_node'].filepath_str()} -> {op['new_node'].filepath_str()}"
-    else:
-        raise Exception("Unsupported op: " + op["kind"])
-
 
 
 # Functions that are called from Vim
@@ -633,7 +380,8 @@ def init():
     #      autocmd so that it doesn't mess with the alt file)
 
     # We need to query the alt file *before* switching the buffer
-    alt_buf = vim.eval('bufnr("#")')
+    alt_buf = int(vim.eval('bufnr("#")'))
+    replaced_buf = int(vim.eval('bufnr("%")'))
 
     # Create new buffer and set options
     # Initially, I was using `bufadd()` instead of `:edit` but this leaves the
@@ -648,35 +396,53 @@ def init():
 
     vim.command("setlocal expandtab")
 
-    buf_no = BufNo(vim.current.buffer.number)
+    buf_no = int(vim.current.buffer.number)
+    path_info = GLOBAL_TREE_STATE.path_info.clone()
+    path_info.set_expanded(GLOBAL_TREE_STATE.root_dir, True)
+
     SESSIONS[buf_no] = Session(
         buf_no = buf_no,
         alternate_buf = alt_buf,
-        view = DirView(
-            next_gen_id(),
+        replaced_buf = replaced_buf,
+        base_tree = DirTree(
             GLOBAL_TREE_STATE.root_dir,
-            GLOBAL_TREE_STATE.expanded_dirs,
-            GLOBAL_TREE_STATE.show_dotfiles,
             GLOBAL_TREE_STATE.show_details,
-        )
+            GLOBAL_TREE_STATE.show_dotfiles
+        ),
+        cur_path = GLOBAL_TREE_STATE.root_dir,
+        path_info = path_info,
+        changedtick = 0,
     )
+
 
     vim.eval(f'prop_type_add("vfx_change", {{"bufnr": {buf_no}, "highlight": "Changed"}})')
     vim.eval(f'prop_type_add("vfx_remove", {{"bufnr": {buf_no}, "highlight": "Removed"}})')
+    vim.eval(f'prop_type_add("vfx_error", {{"bufnr": {buf_no}, "highlight": "Error"}})')
 
-    update_buffer()
+    s = SESSIONS[buf_no]
+    refresh_node(s.base_tree, s.base_tree.root, s.path_info.lookup_or_create(s.base_tree.root_dir()), refresh=True, error_callback=print_error)
+    update_buffer(s.base_tree)
+
     vim_set_line_no(GLOBAL_TREE_STATE.cursor_line)
     vim_set_column_no(GLOBAL_TREE_STATE.cursor_column)
+
+    s.changedtick = vim_changetick()
 
 
 def quit():
     s = get_session(); assert s
 
+    if is_buf_modified():
+        print("There are unsaved changes")
+        return
+
     # Since we have set bufhidden=wipe, quitting is done by simply switching
-    # to another buffer (to the alternative buffer in this case)
-    alt_buf_no = int(vim.eval('bufnr("#")'))
-    if alt_buf_no != s.buf_no and int(vim.eval(f"buflisted({alt_buf_no})")):
-        vim.command(f"buffer {alt_buf_no}")
+    # to another buffer (to the alternative buffer in this case).
+    # Note that we need to use the value of `bufnr("#")` at the time init() was called, which we
+    # store in s.replaced_buf. This is because renaming a buffer (like we do when changing the
+    # directory) updates the alternative buffer.
+    if s.replaced_buf != s.buf_no and int(vim.eval(f"buflisted({s.replaced_buf})")):
+        vim.command(f"buffer {s.replaced_buf}")
     else:
         vim.command("enew")
         # This completely deletes the buffer once it is hidden (it won't even
@@ -688,203 +454,206 @@ def quit():
     restore_alternate_buf(s)
 
 
-def open_entry():
-    if is_buf_modified():
-        print("There are unsaved changes")
-        return
 
+def open_entry(split_window: bool = False):
     s = get_session(); assert s
-    filepath = s.view.root_dir() / get_path_at(vim_get_line_no(), s.indent_offset)
+    buf_tree = update_session_from_buf__return_tree(s)
+
+    filepath = s.cur_path / get_path_at(vim_get_line_no())
     if filepath.is_dir():
         change_dir(s, filepath)
-        update_buffer()
-    else:
+        update_buf_tree_from_base(buf_tree, s.cur_path, s.base_tree, s.path_info, s.mods_by_id)
+        update_buffer(buf_tree)
+    elif filepath.is_file():
         default_app = default_app_for(filepath)
         if should_open_in_vim(default_app):
-            vim.command("keepalt edit " + escape_fn_for_vim_cmd(str(filepath)))
+            open_filepath = filepath
+            cwd = vim.eval("getcwd()")
+            if filepath.is_relative_to(cwd):
+                open_filepath = filepath.relative_to(cwd)
+            if split_window:
+                cur_win = int(vim.eval("winnr()"))
+                prev_win = int(vim.eval("winnr('#')"))
+                if prev_win == 0 or prev_win == cur_win:
+                    vim.command("vsplit")
+                else:
+                    vim.command(f"{prev_win}wincmd w")
+
+            vim.command("keepalt edit " + escape_fn_for_vim_cmd(str(open_filepath)))
         else:
-            subprocess.Popen(["xdg-open", filepath], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            xdg_open_bin = shutil.which("xdg-open")
+            if xdg_open_bin is None:
+                raise Exception("xdg-open could not be found")
+
+            # Redirecting stdin, stdout and stderr ensures that the terminal can be closed even if
+            # the spawned process is still running
+            subprocess.Popen([xdg_open_bin, filepath], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
 
 def open_vim_cwd():
     s = get_session(); assert s
-    change_dir(s, vim.eval("getcwd()"))
-    update_buffer()
+    vim_cd(s.base_tree.root_dir())
 
 
 def change_vim_cwd():
     s = get_session(); assert s
-    vim_cd(s.view.root_dir())
-
-
-def toggle_expand():
-    if is_buf_modified():
-        print("There are unsaved changes")
-        return
-
-    s = get_session(); assert s
-    if s.view.toggle_expand(get_path_at(vim_get_line_no(), s.indent_offset)):
-        update_buffer()
+    buf_tree = update_session_from_buf__return_tree(s)
+    change_dir(s, Path(vim.eval("getcwd()")))
+    update_buf_tree_from_base(buf_tree, s.cur_path, s.base_tree, s.path_info, s.mods_by_id)
+    update_buffer(buf_tree)
 
 
 def move_up():
-    if is_buf_modified():
-        print("There are unsaved changes")
+    s = get_session(); assert s
+    buf_tree = update_session_from_buf__return_tree(s)
+    change_dir(s, s.cur_path.parent)
+    update_buf_tree_from_base(buf_tree, s.cur_path, s.base_tree, s.path_info, s.mods_by_id)
+    update_buffer(buf_tree)
+
+
+def toggle_expand():
+    s = get_session(); assert s
+    buf_tree = update_session_from_buf__return_tree(s)
+    node = buf_tree.try_lookup(get_path_at(vim_get_line_no()))
+    if node is None or not node.is_dir() or node.is_new():
         return
 
-    # TODO[Bug] When moving up and then closing vfx, you are presented with a new, empty buffer instead of switching back to the alt buffer
+    s.path_info.set_expanded(node.abs_filepath(), not node.is_expanded)
 
-    s = get_session(); assert s
-    root_dir = s.view.root_dir()
-    if root_dir.parent != root_dir:
-        change_dir(s, root_dir.parent)
-        update_buffer()
+    update_base_tree_from_buf(s.base_tree, buf_tree, s.path_info, error_callback=print_error)
+    update_buf_tree_from_base(buf_tree, s.cur_path, s.base_tree, s.path_info, s.mods_by_id)
+    update_buffer(buf_tree)
 
 
 def toggle_dotfiles():
-    if is_buf_modified():
-        print("There are unsaved changes")
-        return
-
     s = get_session(); assert s
-    s.view.show_dotfiles = not s.view.show_dotfiles
-    s.view.refresh_from_fs()
-    update_buffer()
+    buf_tree = update_session_from_buf__return_tree(s)
+    buf_tree.has_dotfiles = not buf_tree.has_dotfiles
+
+    update_base_tree_from_buf(s.base_tree, buf_tree, s.path_info, error_callback=print_error)
+    update_buf_tree_from_base(buf_tree, s.cur_path, s.base_tree, s.path_info, s.mods_by_id)
+    update_buffer(buf_tree)
 
 
 def toggle_details():
-    if is_buf_modified():
-        print("There are unsaved changes")
-        return
-
     s = get_session(); assert s
-    s.view.show_details = not s.view.show_details
-    s.view.refresh_from_fs()
-    update_buffer()
+    buf_tree = update_session_from_buf__return_tree(s)
+    buf_tree.has_details = not buf_tree.has_details
 
-
-def update_buffer():
-    s = get_session(); assert s
-    with io.StringIO() as buf:
-        s.indent_offset = write_tree(buf, s.view)
-        buf.seek(0, io.SEEK_SET)
-        vim_set_buffer_contents(buf.readlines())
-
-        first_tab_stop = s.indent_offset + CONFIG.node_state_symbol_width + 1 # +1 for the space following the node state symbol
-        vim.command(f"setl varsofttabstop={first_tab_stop},{CONFIG.indent_width}")
-        # There is also 'vartabstop' in case I want to support tabs for indentation
-
-    vim.command("setl nomodified")
+    update_base_tree_from_buf(s.base_tree, buf_tree, s.path_info, error_callback=print_error)
+    update_buf_tree_from_base(buf_tree, s.cur_path, s.base_tree, s.path_info, s.mods_by_id)
+    update_buffer(buf_tree)
 
 
 # For internal use only. Called when the BufWriteCmd autocmd event is fired.
-def on_buf_save():
-    if is_buf_modified():
-        s = get_session(); assert s
-
-        node_changes = compute_node_changes(s.view, vim.current.buffer, s.indent_offset)
-        operations = compute_operations(node_changes)
-        if not operations:
-            vim.command("setl nomodified") # Don't mark the buffer as modified
-            return
-
-        apply_changes = True
-        if CONFIG.confirm_changes:
-            for op in operations:
-                print(op_to_str(op))
-
-            choice = int(vim.eval('confirm("Apply changes?", "yes\nno", 2)'))
-            apply_changes = choice == 1
-
-        if apply_changes:
-            buffers_by_name = {buf.name: buf for buf in vim.buffers if buf.valid}
-            for op in operations:
-                if op["kind"] == "NEW":
-                    filepath = s.view.root_dir() / op["node"].filepath()
-                    if op["node"].is_file():
-                        if filepath.exists():
-                            print("Error: destination already exists: " + str(filepath))
-                            print("Aborting")
-                            return
-                        else:
-                            filepath.touch()
-                    else:
-                        filepath.mkdir(parents=True)
-
-                elif op["kind"] == "REMOVE":
-                    filepath = s.view.root_dir() / op["node"].filepath()
-                    subprocess.run(["trash", "--", filepath])
-
-                elif op["kind"] == "COPY":
-                    old_filepath = s.view.root_dir() / op["old_node"].filepath()
-                    new_filepath = s.view.root_dir() / op["new_node"].filepath()
-                    if new_filepath.exists():
-                        print("Error: destination already exists: " + str(new_filepath))
-                        print("Aborting")
-                        return
-                    else:
-                        if op["old_node"].is_file():
-                            shutil.copyfile(old_filepath, new_filepath, follow_symlinks=False)
-                        else:
-                            shutil.copytree(old_filepath, new_filepath, symlinks=True)
-
-                elif op["kind"] == "MOVE":
-                    old_filepath = s.view.root_dir() / op["old_node"].filepath()
-                    new_filepath = s.view.root_dir() / op["new_node"].filepath()
-                    if new_filepath.exists():
-                        print("Error: destination already exists: " + str(new_filepath))
-                        print("Aborting")
-                        return
-                    else:
-                        # TODO When renaming a directory, we need to rename all open child buffers
-
-                        # For the lookup to work old_filepath needs to denote an absolute path
-                        buffer = buffers_by_name.get(str(old_filepath))
-                        if buffer is None:
-                            old_filepath.rename(new_filepath)
-                        else:
-                            move_file(buffer, new_filepath)
-
-                else:
-                    raise Exception("Unsupported op: " + op["kind"])
-
-
-            s.view.refresh_from_fs()
-            update_buffer()
+#def on_buf_save():
+#    if is_buf_modified():
+#        s = get_session(); assert s
+#
+#        node_changes = compute_node_changes(s.view, vim.current.buffer, s.indent_offset)
+#        operations = compute_operations(node_changes)
+#        if not operations:
+#            vim.command("setl nomodified") # Don't mark the buffer as modified
+#            return
+#
+#        apply_changes = True
+#        if CONFIG.confirm_changes:
+#            for op in operations:
+#                print(op_to_str(op))
+#
+#            choice = int(vim.eval('confirm("Apply changes?", "yes\nno", 2)'))
+#            apply_changes = choice == 1
+#
+#        if apply_changes:
+#            buffers_by_name = {buf.name: buf for buf in vim.buffers if buf.valid}
+#            for op in operations:
+#                if op["kind"] == "NEW":
+#                    filepath = s.view.root_dir() / op["node"].filepath()
+#                    if op["node"].is_file():
+#                        if filepath.exists():
+#                            print("Error: destination already exists: " + str(filepath))
+#                            print("Aborting")
+#                            return
+#                        else:
+#                            filepath.touch()
+#                    else:
+#                        filepath.mkdir(parents=True)
+#
+#                elif op["kind"] == "REMOVE":
+#                    filepath = s.view.root_dir() / op["node"].filepath()
+#                    subprocess.run(["trash", "--", filepath])
+#
+#                elif op["kind"] == "COPY":
+#                    old_filepath = s.view.root_dir() / op["old_node"].filepath()
+#                    new_filepath = s.view.root_dir() / op["new_node"].filepath()
+#                    if new_filepath.exists():
+#                        print("Error: destination already exists: " + str(new_filepath))
+#                        print("Aborting")
+#                        return
+#                    else:
+#                        if op["old_node"].is_file():
+#                            shutil.copyfile(old_filepath, new_filepath, follow_symlinks=False)
+#                        else:
+#                            shutil.copytree(old_filepath, new_filepath, symlinks=True)
+#
+#                elif op["kind"] == "MOVE":
+#                    old_filepath = s.view.root_dir() / op["old_node"].filepath()
+#                    new_filepath = s.view.root_dir() / op["new_node"].filepath()
+#                    if new_filepath.exists():
+#                        print("Error: destination already exists: " + str(new_filepath))
+#                        print("Aborting")
+#                        return
+#                    else:
+#                        # TODO When renaming a directory, we need to rename all open child buffers
+#
+#                        # For the lookup to work old_filepath needs to denote an absolute path
+#                        buffer = buffers_by_name.get(str(old_filepath))
+#                        if buffer is None:
+#                            old_filepath.rename(new_filepath)
+#                        else:
+#                            move_file(buffer, new_filepath)
+#
+#                else:
+#                    raise Exception("Unsupported op: " + op["kind"])
+#
+#
+#            s.view.refresh_from_fs()
+#            update_buffer()
 
 
 def display_changes():
-    def add_text_prop(line_no, text, style, align = "after"):
-        if align == "after":
-            text = "    " + text
-        else:
-            text += "\n"
-        vim.eval(f'prop_add({line_no}, 0, {{"type": "{style}", "text": {escape_for_vim_expr(text)}, "text_align": "{align}"}})')
-
     # TODO Use b:changetick to only recompute the changes if the buffer has changed
 
     s = get_session(); assert s
-    node_changes = compute_node_changes(s.view, vim.current.buffer, s.indent_offset)
-    operations = compute_operations(node_changes)
+    buf_tree = update_session_from_buf__return_tree(s)
+    mods = compute_changes(s.base_tree, buf_tree)
+    s.mods_by_id = get_mods_by_id(mods)
     vim.eval('prop_clear(1, line("$"))')
-    for op in operations:
-        if op["kind"] == "NEW":
-            add_text_prop(op["node"].line_no, op_to_str(op), style="vfx_change")
-        elif op["kind"] == "REMOVE":
-            if op["line_no"] is None:
+    for mod in mods:
+        for op in mod.get_ops():
+            if op["kind"] == "delete":
                 add_text_prop(1, op_to_str(op), align="above", style="vfx_remove")
+            elif op["kind"] == "create":
+                add_text_prop(op['node'].line_no, op_to_str(op), style="vfx_change")
+            elif op["kind"] in ["move", "copy"]:
+                add_text_prop(op['dest_node'].line_no, op_to_str(op), style="vfx_change")
+
+
+    def display_errors(node: DirNode):
+        if node.error:
+            if node.line_no is None:
+                add_text_prop(1, node.error, align="above", style="vfx_error")
             else:
-                add_text_prop(op["line_no"], op_to_str(op), style="vfx_remove")
-        elif op["kind"] == "COPY":
-            add_text_prop(op["line_no"], op_to_str(op), style="vfx_change")
-        elif op["kind"] == "MOVE":
-            add_text_prop(op["line_no"], op_to_str(op), style="vfx_change")
-        else:
-            raise Exception("Unsupported op: " + op["kind"])
+                add_text_prop(node.line_no, node.error, style="vfx_error")
+
+        if node.is_dir() and node.is_expanded:
+            for child in node.children:
+                display_errors(child)
+
+    display_errors(buf_tree.root)
 
 
-
-# For internal use. Called when the BufUnload autocmd event is fired.
+# For internal use only. Called when the BufUnload autocmd event is fired.
 def on_buf_unload():
     s = get_session()
     # Check if we have already exited
@@ -895,10 +664,8 @@ def on_buf_unload():
     restore_alternate_buf(s)
 
 
-# For internal use. Set as 'indentexpr'.
+# For internal use only. Set as 'indentexpr'.
 def get_indent_for_vim(line_no: int) -> int:
-    s = get_session()
-
     if line_no <= 1:
         return 0
 
@@ -925,3 +692,23 @@ def get_indent_for_vim(line_no: int) -> int:
         return segments.node_state.start + 2 # +1 for the conceal-character and +1 for the following space
     else:
         return segments.name.start
+
+
+class Logger:
+    buf_no: int
+
+    def info(self, msg: str):
+        vim.buffers[self.buf_no].append(msg)
+
+
+def open_logger():
+    buf_name = "Vfx Log"
+    if not is_buf_name_available(buf_name):
+        print("Log already open")
+        return
+
+    vim.command("vsplit " + escape_fn_for_vim_cmd("Vfx Log"))
+    vim.command('setlocal bufhidden=wipe')
+    vim.command('setlocal buftype=acwrite')
+    vim.command('setlocal noswapfile')
+    vim.command('setlocal buflisted')

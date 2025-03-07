@@ -7,19 +7,12 @@ from dataclasses import (
 from typing import (
     Optional,
     Callable,
-    TypeVar
+    TypeVar,
+    Any
 )
 
 from config import Config, NodeState
-from dir_tree import (
-    DirTree,
-    DirView,
-    DirNode,
-    NodeKind,
-    LinkStatus,
-    NodeID,
-    NodeDetails
-)
+from dir_tree import *
 
 
 # Parser
@@ -129,22 +122,84 @@ def unwrap(v: Optional[T]) -> T:
 #===============================================================================
 @dataclass
 class Span:
-    start: int
-    end: int # exclusive
+    start: int = 0
+    end: int = 0 # exclusive
 
-def empty_span():
-    return Span(0, 0)
 
 @dataclass
 class LineSegments:
     details: Optional[Span] = None
     node_state: Optional[Span] = None
-    name: Span = field(default_factory=empty_span)
+    name: Span = field(default_factory=Span)
+
+
+# Describes the offset (in spaces) from the start of a line to the first significant character on
+# that line.
+#
+# If base_offset is not None, then the first significant character is at position base_offset + entry_offset.
+# Otherwise,
+#
+# What is the difference between `base_offset == None` and `base_offset == 0`? Consider the
+# following example:
+#
+#    ·················································new_dir/
+#    ·····················································new_sub
+#    [drwxr-xr-x david david 4.0K 2025-01-28 09:25]·····+1_ sub/
+#
+# Here, · denotes a space that is relevant for computing the indentation of an entry, and we assume
+# a indent_width of 4. Parsing starts at the top.
+# - Since the first line has no details, we set base_offset=None and entry_offset=47 (see
+#   EntryOffset.from_segments())
+# - For the second line, we set base_offset=None and entry_offset=51.
+#   Computing the diff between these to EntryOffset gives 4, which means the indention level of
+#   new_sub is higher (by one) than new_dir
+# - For the third line we set base_offset=46 and entry_offset=4. Because the previous line has no
+#   base_offset, we need to rebase it before we can compute the diff between them.
+
+@dataclass
+class EntryOffset:
+    base_offset: Optional[int] = None
+    entry_offset: int = 0
+
+    @staticmethod
+    def from_segments(segments: LineSegments, config: Config) -> "EntryOffset":
+        offset = EntryOffset()
+
+        if segments.node_state is None:
+            # Even if there is no node state we calculate the indentation as if there was
+            offset.entry_offset = segments.name.start - config.node_state_symbol_width - 1
+        else:
+            offset.entry_offset = segments.node_state.start
+
+        if segments.details is not None:
+            offset.rebase(segments.details.end)
+
+        return offset
+
+
+    def diff(self, other: "EntryOffset") -> int:
+        return self._abs_offset(other.base_offset) - other._abs_offset(self.base_offset)
+
+
+    def rebase(self, new_base_offset: int):
+        assert self.base_offset is None # Ignore this case as I don't need it
+        self.base_offset = new_base_offset
+        self.entry_offset = max(self.entry_offset - self.base_offset - NUM_SPACES_IGNORED_AFTER_DETAILS, 0)
+
+
+    def _abs_offset(self, other_base_offset: Optional[int]) -> int:
+        if self.base_offset is not None:
+            return self.entry_offset
+
+        if other_base_offset is not None:
+            return max(self.entry_offset - other_base_offset, 0)
+
+        return self.entry_offset
 
 
 @dataclass
 class DecoratedNodeID:
-    id: NodeID
+    id: NodeIDKnown
     is_executable: bool
 
 
@@ -154,54 +209,113 @@ class NewNode:
     kind: NodeKind
 
 
-def compute_indent(config: Config, segments: LineSegments, indent_offset: int) -> int:
-    first_significant_char = 0
-    if segments.node_state is None:
-        # Even if there is no node state we calculate the indentation as if there was
-        first_significant_char = segments.name.start - config.node_state_symbol_width - 1
-    else:
-        first_significant_char = segments.node_state.start
+def parse_buffer(config: Config, lines: list[str]) -> DirTree:
+    assert NUM_LINES_BEFORE_TREE == 1
+    options = parse_options(lines[0])
+    tree = parse_tree(config,
+        options["path"],
+        options["show_details"],
+        options["show_dotfiles"],
+        lines[1:],
+        line_offset=1
+    )
+    tree.root.id = NodeIDKnown(options["root_id"])
+    return tree
 
-    indent = max(first_significant_char - indent_offset, 0) // config.indent_width
-    return indent
+
+def parse_options(line: str):
+    [options_str, root_path] = line.split("|", maxsplit=1)
+
+    if not options_str.startswith(">"):
+        raise Exception("Options line must start with '>'")
+
+    options: dict[str, Any] = {
+        "path": Path(root_path.strip()),
+    }
+    for option in options_str[1:].split():
+        [name, value] = option.split("=")
+        options[name] = parse_option_value(value)
+
+    return options
 
 
-def parse_tree(config: Config, root_dir: Path, lines: list[str], indent_offset: int) -> DirTree:
-    tree = DirTree(-1, root_dir)
+def parse_option_value(value: str) -> bool|int:
+    if value == "True":
+        return True
+
+    if value == "False":
+        return False
+
+    if value.isdecimal():
+        return int(value)
+
+    raise Exception("Invalid option value: " + value)
+
+
+
+def parse_tree(
+    config: Config,
+    root_dir: Path,
+    has_details: bool,
+    has_dotfiles: bool,
+    lines: list[str],
+    line_offset: int
+) -> DirTree:
+    tree = DirTree(root_dir, has_details, has_dotfiles)
+    tree.root.is_expanded = True
     parent_stack: list[DirNode] = [tree.root]
-    prev_indent = 0
     prev_node: Optional[DirNode] = None
+    prev_offset: Optional[EntryOffset] = None
     for line_idx, line in enumerate(lines):
         if not line.strip():
             continue
 
+        errors: list[str] = []
         parsed_node, segments = parse_line(config, line)
-        indent = compute_indent(config, segments, indent_offset)
+        offset = EntryOffset.from_segments(segments, config)
 
-        # Update parent stack if indention has changed
-        if indent < prev_indent:
-            for i in range(prev_indent - indent):
-                parent_stack.pop()
-            prev_indent = indent
-        elif indent > prev_indent:
-            if not prev_node:
-                raise Exception("First line cannot be indented")
-            if not prev_node.is_dir():
-                raise Exception("Parent is not a directory (indent = " + str(indent))
-            parent_stack.append(prev_node)
-            prev_indent += 1
+        # Handle changes in indentation
+        if prev_offset is None:
+            prev_offset = offset
+        else:
+            # Compute indent of the current line relative to the previous line
+            if prev_offset.base_offset is None and offset.base_offset is not None:
+                prev_offset.rebase(offset.base_offset)
+
+            relative_indent = int(offset.diff(prev_offset) / config.indent_width)
+
+            # Update parent stack if indention has changed
+            if relative_indent < 0:
+                for i in range(-relative_indent):
+                    parent_stack.pop()
+                prev_offset.entry_offset = offset.entry_offset
+            elif relative_indent > 0:
+                if not prev_node:
+                    errors.append("First line cannot be indented")
+                elif not prev_node.is_dir():
+                    errors.append("Parent is not a directory")
+                else:
+                    parent_stack.append(prev_node)
+                    prev_offset.entry_offset += config.indent_width
 
         parent = parent_stack[-1]
         match parsed_node:
             case DirNode() as node:
+                if node.details is None and has_details:
+                    errors.append("Nodes are expected to have details")
+
                 node.parent = parent
-                node.line_no = line_idx + 1
+                node.line_no = line_idx + line_offset + 1
+                for error in errors:
+                    node.add_error(error)
                 parent.children.append(node)
                 prev_node = node
 
             case NewNode() as new_node:
-                node = tree.lookup_or_create(parent.filepath() / new_node.name, new_node.kind)
-                node.line_no = line_idx + 1
+                node = tree.lookup_or_create_new(parent.filepath() / new_node.name, new_node.kind)
+                node.line_no = line_idx + line_offset + 1
+                for error in errors:
+                    node.add_error(error)
                 prev_node = node
 
     return tree
@@ -314,9 +428,7 @@ def try_parse_node_state(config: Config, parser: ParseState, segments: LineSegme
 
 NODE_FLAGS_LEN = 1
 def parse_node_id(parser: ParseState) -> DecoratedNodeID:
-    gen_id = parse_int(parser, "generation ID")
-    consume(parser, ":")
-    node_id = parse_int(parser, "node ID")
+    seq_no = parse_int(parser, "node sequence no")
 
     is_executable = False
     flags = consume_n(parser, NODE_FLAGS_LEN)
@@ -328,7 +440,7 @@ def parse_node_id(parser: ParseState) -> DecoratedNodeID:
     consume(parser, " ")
 
     return DecoratedNodeID(
-        id = (gen_id, node_id),
+        id = NodeIDKnown(seq_no),
         is_executable = is_executable,
     )
 
@@ -374,6 +486,8 @@ def parse_link_status(parser: ParseState) -> tuple[LinkStatus, Optional[Path]]:
         else:
             link_status = LinkStatus.GOOD
 
-        link_target = Path(parse_node_name(parser, None)[1])
+        skip_whitespace(parser)
+        if not parser.done():
+            link_target = Path(parse_node_name(parser, None)[1])
 
     return link_status, link_target
