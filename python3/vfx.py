@@ -27,12 +27,72 @@ from dir_parser import (
     NODE_FLAGS_LEN,
     EntryOffset,
 )
-from logger import LOG, LogLevel
+import log
 
 
 # TODO Test edge case: Changing a directory to a file with the same name (and vice versa)
 
 # TODO Use listener_add() to listen for changes to the buffer so we don't need to reparse everything
+
+
+# Logger
+#===============================================================================
+class LoggerVim(log.Logger):
+    buf_no: int
+    indent_level: int
+    log_level: log.Level
+    counter: int
+    first_line: bool
+
+    def __init__(self, buf_no: int, log_level: log.Level):
+        self.indent_level = 0
+        self.buf_no = buf_no
+        self.log_level = log_level
+        self.counter = 1
+        self.first_line = True
+
+    def cur_line_no(self) -> int:
+        return len(vim.buffers[self.buf_no])
+
+    def info(self, msg: str):
+        if self.log_level.value >= log.Level.INFO.value:
+            self._append_line(msg)
+
+    def info_add(self, msg: str, line_no: int):
+        if self.log_level.value >= log.Level.INFO.value:
+            self._append_to_line(msg, line_no)
+
+    def debug(self, msg: str):
+        if self.log_level.value >= log.Level.DEBUG.value:
+            self._append_line(msg)
+
+    def scope(self, name: str) -> log.LogScope:
+        self.info(name)
+        return log.DefaultLogScope(self)
+
+    def increase_indent(self):
+        self.indent_level += 1
+
+    def decrease_indent(self):
+        assert self.indent_level > 0
+        self.indent_level -= 1
+
+    def _append_line(self, line: str):
+        counter_str = ""
+        if self.indent_level == 0:
+            counter_str = f"#{self.counter} "
+            self.counter += 1
+
+        log_str = (" "*self.indent_level*4) + counter_str + line
+        buffer = vim.buffers[self.buf_no]
+        if self.first_line:
+            vim.buffers[self.buf_no][0] = log_str
+            self.first_line = False
+        else:
+            buffer.append(log_str)
+
+    def _append_to_line(self, line: str, line_no: int):
+        vim.buffers[self.buf_no][line_no-1] += line
 
 
 # Global state
@@ -418,7 +478,7 @@ def open_logger():
     vim.command(r'syn match Type "\[.\+\]"')
     vim.command(r'syn match Comment "#\d\+"')
 
-    LOG.init_buf(int(vim.eval("bufnr()")), CONFIG.log_level)
+    log.LOG = LoggerVim(int(vim.eval("bufnr()")), CONFIG.log_level)
     vim.command("wincmd p")
 
 
@@ -704,7 +764,7 @@ def buffer_changed():
 
 
     s = get_session(); assert s
-    with LOG.scope("Buffer changed") as scope:
+    with log.scope("Buffer changed") as scope:
         if s.update_from_buf():
             # Display modifications/errors
             vim.eval('prop_clear(1, line("$"))')

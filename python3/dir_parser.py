@@ -13,7 +13,7 @@ from typing import (
 
 from config import Config, NodeState
 from dir_tree import *
-from logger import LOG
+import log
 
 
 # Parser
@@ -211,7 +211,7 @@ class NewNode:
 
 
 def parse_buffer(config: Config, lines: list[str]) -> DirTree:
-    with LOG.scope("Parsing buffer"):
+    with log.scope("Parsing buffer"):
         assert NUM_LINES_BEFORE_TREE == 1
         options = parse_options(lines[0])
         tree = parse_tree(config,

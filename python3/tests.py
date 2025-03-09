@@ -5,6 +5,7 @@ import shutil
 from config import Config, default_config
 from pathlib import Path
 from dataclasses import field
+from typing import Callable
 
 from dir_tree import *
 from dir_parser import (
@@ -109,6 +110,12 @@ def to_set(root: PathInfoNode) -> set[Path]:
     return expanded_dirs
 
 
+def visit_nodes(root: DirNode, cb: Callable[[DirNode], None]):
+    cb(root)
+    for child in root.children:
+        visit_nodes(child, cb)
+
+
 class TestSession:
     test_dir: Path
     base_tree: DirTree
@@ -157,7 +164,13 @@ class TestSession:
         is_expanded = self.path_info.is_expanded_at(abs_path)
         self.path_info.set_expanded(abs_path, not is_expanded)
 
-        update_base_tree_from_buf(self.base_tree, self.buf_tree, self.path_info, error_callback=print_error)
+        self._update_base_tree()
+        update_buf_tree_from_base(self.buf_tree, self.buf_tree.root_dir(), self.base_tree, self.path_info, get_mods_by_id(self.modifications))
+        self.modifications = compute_changes(self.base_tree, self.buf_tree)
+
+    def show_details(self, show: bool):
+        self.buf_tree.has_details = show
+        self._update_base_tree()
         update_buf_tree_from_base(self.buf_tree, self.buf_tree.root_dir(), self.base_tree, self.path_info, get_mods_by_id(self.modifications))
         self.modifications = compute_changes(self.base_tree, self.buf_tree)
 
@@ -183,7 +196,7 @@ class TestSession:
     def update_buffer(self, new_buffer: str):
         self.buf_tree = parse_buffer(self.config, new_buffer.strip().splitlines())
         self.path_info.set_node(self.buf_tree.root_dir(), get_expanded_dirs_for_node(self.buf_tree.root))
-        update_base_tree_from_buf(self.base_tree, self.buf_tree, self.path_info, error_callback=print_error)
+        self._update_base_tree()
 
         if self.buf_tree.root_dir() != self.cur_path:
             self.change_dir(self.buf_tree.root_dir().relative_to(self.test_dir))
@@ -193,6 +206,25 @@ class TestSession:
 
     def get_buffer(self) -> str:
         return tree_to_string(self.buf_tree, self.buf_tree.root, None, self.config)
+
+
+
+    def _update_base_tree(self, refresh: bool = False):
+        need_refresh = False
+
+        if self.base_tree.has_details != self.buf_tree.has_details:
+            self.base_tree.has_details = self.buf_tree.has_details
+            need_refresh = self.buf_tree.has_details
+
+        # We don't copy show_dotfiles because we always load dotfiles to keep NodeIDs stable
+
+        refresh_node(
+            self.base_tree,
+            self.base_tree.root,
+            self.path_info.try_lookup(self.base_tree.root_dir()),
+            refresh = refresh or need_refresh,
+            error_callback = print_error
+        )
 
 
 # Tests
@@ -566,6 +598,34 @@ f"""
     assert s.buf_tree.lookup(Path("sub")).is_expanded == False
 
 
+def test_toggle_details():
+    # Prepare test directory
+    test_dir = TEST_REALM_DIR / inspect.getframeinfo(unwrap(inspect.currentframe())).function
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+    scenario = (
+f"""
+> root_id=0 show_details=False show_dotfiles=False | {test_dir}
+-2_ baz/
+    -12_ sub/
+        |13_ subfile
+    |9_ ciao
+    |10_ hello
+|6_ bar
+|1_ foo
+"""
+)
+    s = TestSession.init_fs(mk_tree(scenario), init_dir="./")
+    s.set_expanded("baz", True)
+    s.show_details(True)
+
+
+    def node_has_details(node: DirNode):
+        assert node.details is not None
+
+    visit_nodes(s.buf_tree.root, node_has_details)
+
+
 # Main
 #===============================================================================
 TEST_REALM_DIR.mkdir(exist_ok=True)
@@ -580,3 +640,4 @@ test_up_twice()
 test_up_up_expand()
 test_parsing()
 test_expand_cd_sub()
+test_toggle_details()

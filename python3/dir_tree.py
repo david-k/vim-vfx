@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Optional, NewType, TextIO, Callable, Any
 
 from config import Config
-from logger import LOG
+import log
 
 
 # Directory tree
@@ -157,7 +157,7 @@ class DirNode:
             case NodeIDNew():
                 print(f"{'':<{indent}}NewNode(\"{self.name}\")")
             case NodeIDKnown(seq_no):
-                print(f"{'':<{indent}}KnownNode({seq_no}, \"{self.name}\", {self.is_expanded})")
+                print(f"{'':<{indent}}KnownNode({seq_no}, \"{self.name}\", expanded={self.is_expanded}, details={self.details is not None})")
 
         for child in self.children:
             child.print(indent + 4)
@@ -850,7 +850,7 @@ def refresh_node(
     refresh: bool,
     error_callback: Callable[[str], None],
 ):
-    with LOG.scope("Refresh node") as scope:
+    with log.scope("Refresh node") as scope:
         stats = RefreshStats()
         stats.num_nodes_visited += 1
         _refresh_node(tree, node, path_info, refresh, error_callback, stats)
@@ -898,9 +898,10 @@ def _refresh_node(
                 stats.num_scandir_queries += 1
                 with os.scandir(node_abspath) as entries:
                     for entry in entries:
-                        LOG.debug(f"ScandirNext {entry.path}")
+                        log.debug(f"ScandirNext {entry.path}")
                         stats.num_scandir_queries += 1
                         child_node = nodes_by_name.get(entry.name)
+                        node_is_fresh = child_node is None
                         if child_node is None:
                             stats.num_file_queries += 1
                             info = _query_entry_info(Path(entry.path), tree.has_details)
@@ -918,8 +919,11 @@ def _refresh_node(
                                 details = info["details"],
                             )
 
-                        # Set refresh=False because we just created the node
-                        _refresh_node(tree, child_node, get_child(path_info, child_node.name), False, error_callback, stats)
+                        refresh_child = refresh
+                        if node_is_fresh:
+                            refresh_child = False
+
+                        _refresh_node(tree, child_node, get_child(path_info, child_node.name), refresh_child, error_callback, stats)
                         node.children.append(child_node)
 
                     node.children.sort(key=node_sort_key)
@@ -1013,7 +1017,7 @@ def _refresh_node(
 
 
 def _query_entry_info(path: Path, load_details: bool) -> dict:
-    LOG.debug(f"Query {path}")
+    log.debug(f"Query {path}")
 
     link_target = None
     link_status = LinkStatus.NO_LINK
