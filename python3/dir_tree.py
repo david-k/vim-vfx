@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Optional, NewType, TextIO, Callable, Any
 
 from config import Config
+from logger import LOG
 
 
 # Directory tree
@@ -273,6 +274,22 @@ class DirTree:
             old_root_parent = self.lookup_or_create_existing(old_root.parent, NodeKind.DIRECTORY, next_id_cb)
             old_root_parent.children.append(old_root_node)
             old_root_node.parent = old_root_parent
+
+        else:
+            self.root = DirNode(
+                id = next_id_cb(self, new_root),
+                name = str(new_root),
+                kind = NodeKind.DIRECTORY,
+                is_expanded = False,
+            )
+
+
+    def is_expanded_at(self, p: Path) -> bool:
+        node = self.try_lookup(p)
+        if node is None:
+            return False
+
+        return node.is_expanded
 
 
     def lookup(self, p: Path) -> DirNode:
@@ -631,18 +648,6 @@ def op_to_str(op: dict) -> str:
     assert False
 
 
-def update_base_tree_from_buf(base_tree: DirTree, buf_tree: DirTree, path_info: PathInfoNode, error_callback: Callable[[str], None]):
-    refresh = False
-
-    if base_tree.has_details != buf_tree.has_details:
-        base_tree.has_details = buf_tree.has_details
-        refresh = buf_tree.has_details
-
-    # We don't copy show_dotfiles because we always load dotfiles to keep NodeIDs stable
-
-    refresh_node(base_tree, base_tree.root, path_info.try_lookup(base_tree.root_dir()), refresh, error_callback)
-
-
 def get_ids_from(tree: DirTree) -> Callable[[DirTree, Path], NodeIDKnown]:
     def get_id_from_cb(_: DirTree, node_path: Path) -> NodeIDKnown:
         node_id = tree.lookup(node_path).id
@@ -832,12 +837,33 @@ def get_child(path_node: Optional[PathInfoNode], child: str) -> Optional[PathInf
     return path_node.children.get(child)
 
 
+class RefreshStats:
+    num_file_queries: int = 0
+    num_scandir_queries: int = 0
+    num_nodes_visited: int = 0
+
+
 def refresh_node(
     tree: DirTree,
     node: DirNode,
     path_info: Optional[PathInfoNode],
     refresh: bool,
     error_callback: Callable[[str], None],
+):
+    with LOG.scope("Refresh node") as scope:
+        stats = RefreshStats()
+        stats.num_nodes_visited += 1
+        _refresh_node(tree, node, path_info, refresh, error_callback, stats)
+        scope.info_add(f" (nodes_visited={stats.num_nodes_visited}, fs_queries={stats.num_file_queries+stats.num_scandir_queries}, refresh={refresh})")
+
+
+def _refresh_node(
+    tree: DirTree,
+    node: DirNode,
+    path_info: Optional[PathInfoNode],
+    refresh: bool,
+    error_callback: Callable[[str], None],
+    stats: RefreshStats,
 ):
     if node.is_new():
         return
@@ -847,6 +873,7 @@ def refresh_node(
     # Newly inserted root nodes don't have their details set so we always load them if they are
     # missing
     if refresh or (node.details is None and tree.has_details):
+        stats.num_file_queries += 1
         info = _query_entry_info(node_abspath, load_details = tree.has_details)
         node.is_executable = info["is_executable"]
         node.link_target = info["link_target"]
@@ -868,10 +895,14 @@ def refresh_node(
             node.children.clear()
             node.is_expanded = True
             try:
+                stats.num_scandir_queries += 1
                 with os.scandir(node_abspath) as entries:
                     for entry in entries:
+                        LOG.debug(f"ScandirNext {entry.path}")
+                        stats.num_scandir_queries += 1
                         child_node = nodes_by_name.get(entry.name)
                         if child_node is None:
+                            stats.num_file_queries += 1
                             info = _query_entry_info(Path(entry.path), tree.has_details)
                             child_node = DirNode(
                                 # We use a dummy ID here and only set the real ID after the children have
@@ -887,10 +918,12 @@ def refresh_node(
                                 details = info["details"],
                             )
 
-                        refresh_node(tree, child_node, get_child(path_info, child_node.name), refresh, error_callback)
+                        # Set refresh=False because we just created the node
+                        _refresh_node(tree, child_node, get_child(path_info, child_node.name), False, error_callback, stats)
                         node.children.append(child_node)
 
                     node.children.sort(key=node_sort_key)
+                    stats.num_nodes_visited += len(node.children)
 
                     for child in node.children:
                         if child.seq_no() == -1:
@@ -911,7 +944,9 @@ def refresh_node(
 
                 child_path_info = get_child(path_info, child.name)
                 if child_path_info and child_path_info.get_expanded_dir_count():
-                    refresh_node(tree, child, child_path_info, refresh, error_callback)
+                    _refresh_node(tree, child, child_path_info, refresh, error_callback, stats)
+
+            stats.num_nodes_visited += len(node.children)
 
 
 # def refresh_node(tree: DirTree, node: DirNode, expanded_dirs: Optional[set[Path]], error_callback: Callable[[str], None]):
@@ -978,6 +1013,8 @@ def refresh_node(
 
 
 def _query_entry_info(path: Path, load_details: bool) -> dict:
+    LOG.debug(f"Query {path}")
+
     link_target = None
     link_status = LinkStatus.NO_LINK
     is_executable = False

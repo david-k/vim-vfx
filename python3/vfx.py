@@ -27,6 +27,7 @@ from dir_parser import (
     NODE_FLAGS_LEN,
     EntryOffset,
 )
+from logger import LOG, LogLevel
 
 
 # TODO Test edge case: Changing a directory to a file with the same name (and vice versa)
@@ -41,37 +42,118 @@ class Session:
     buf_no: int
     alternate_buf: int
     replaced_buf: int
-    base_tree: DirTree
     cur_path: Path
-    changedtick: int
+
+    base_tree: DirTree
+    buf_tree: DirTree
     path_info: PathInfoNode
+
+    mods: list[Modification] = field(default_factory=list)
     mods_by_id: dict[NodeIDKnown, Modification] = field(default_factory=dict)
 
-
-def vim_changetick() -> int:
-    return int(vim.eval("b:changedtick"))
+    changedtick: int = 0
 
 
-def update_session_from_buf(s: Session) -> Optional[DirTree]:
-    changedtick = vim_changetick()
-    if s.changedtick != changedtick:
-        buf_tree = parse_buffer(CONFIG, vim.current.buffer)
-        s.path_info.set_node(buf_tree.root_dir(), get_expanded_dirs_for_node(buf_tree.root))
-        update_base_tree_from_buf(s.base_tree, buf_tree, s.path_info, error_callback=print_error)
-        if buf_tree.root_dir() != s.cur_path:
-            change_dir(s, buf_tree.root_dir())
+    # Changes the root directory to be displayed
+    def change_dir(self, new_dir: Path, update_pwd: bool = False):
+        assert new_dir.is_absolute()
 
-        s.changedtick = changedtick
-        return buf_tree
+        # Add new_dir to base_tree
+        new_dir = new_dir.resolve()
+        self.base_tree.add_path(new_dir)
+        self.cur_path = new_dir
+        self.path_info.set_expanded(new_dir, True)
 
-    return None
+        # Refresh base_tree
+        refresh_node(
+            self.base_tree,
+            self.base_tree.lookup(self.cur_path),
+            path_info = self.path_info.lookup_or_create(self.cur_path),
+            refresh = False,
+            error_callback = print_error,
+        )
+
+        self.update_buf_tree()
+
+        new_name = make_buf_name(str(self.cur_path))
+        rename_nonfile_buffer(vim.current.buffer, new_name)
+        if update_pwd:
+            vim_cd(self.cur_path)
 
 
-def update_session_from_buf__return_tree(s: Session) -> DirTree:
-    if buf_tree := update_session_from_buf(s):
-        return buf_tree
+    # Parses the vim buffer and updates the internal state accordingly (buf_tree, base_tree,
+    # path_info, mods). This means:
+    # - Detecting modifications (i.e. files/directories that have been created/moved/copied/deleted)
+    # - Which directories are expanded
+    # - Whether to show dotfiles/details
+    # This may involve querying the filesystem for new information.
+    def update_from_buf(self) -> bool:
+        changedtick = vim_changetick()
+        if self.changedtick != changedtick:
+            self.buf_tree = parse_buffer(CONFIG, vim.current.buffer)
+            self.path_info.set_node(self.buf_tree.root_dir(), get_expanded_dirs_for_node(self.buf_tree.root))
+            self.update_base_tree()
 
-    return parse_buffer(CONFIG, vim.current.buffer)
+            if self.buf_tree.root_dir() != self.cur_path:
+                self.change_dir(self.buf_tree.root_dir())
+
+            self.mods = compute_changes(self.base_tree, self.buf_tree)
+            self.mods_by_id = get_mods_by_id(self.mods)
+
+            self.changedtick = changedtick
+            return True
+
+        return False
+
+
+    # Whenever buf_tree or path_info is modified this function must be called to ensure that
+    # base_tree can provide the necessary file/directory information.
+    def update_base_tree(self, refresh: bool = False):
+        need_refresh = False
+
+        if self.base_tree.has_details != self.buf_tree.has_details:
+            self.base_tree.has_details = self.buf_tree.has_details
+            need_refresh = self.buf_tree.has_details
+
+        # We don't copy show_dotfiles because we always load dotfiles to keep NodeIDs stable
+
+        refresh_node(
+            self.base_tree,
+            self.base_tree.root,
+            self.path_info.try_lookup(self.base_tree.root_dir()),
+            refresh = refresh or need_refresh,
+            error_callback = print_error
+        )
+
+
+    # Whenever base_tree is changed then this function should be called so that buf_tree can
+    # incorporate the new information.
+    def update_buf_tree(self):
+        update_buf_tree_from_base(self.buf_tree, self.cur_path, self.base_tree, self.path_info, self.mods_by_id)
+
+
+    # Writes buf_tree to the Vim buffer
+    def update_vim_buffer(self):
+        was_modified = is_buf_modified()
+        with io.StringIO() as buf:
+            indent_offset = write_tree(
+                CONFIG,
+                buf,
+                self.buf_tree,
+                self.buf_tree.lookup(self.cur_path),
+                self.path_info.try_lookup(self.cur_path)
+            )
+            buf.seek(0, io.SEEK_SET)
+            vim_set_buffer_contents(buf.readlines())
+
+            self.changedtick = vim_changetick()
+
+            first_tab_stop = indent_offset + CONFIG.node_state_symbol_width + 1 # +1 for the space following the node state symbol
+            vim.command(f"setl varsofttabstop={first_tab_stop},{CONFIG.indent_width}")
+            # There is also 'vartabstop' in case I want to support tabs for indentation
+
+        if not was_modified:
+            vim.command("setl nomodified")
 
 
 @dataclass
@@ -110,30 +192,6 @@ def on_exit(s: Session):
     del SESSIONS[s.buf_no]
 
 
-def change_dir(s: Session, new_dir: Path, update_pwd: bool = False):
-    assert new_dir.is_absolute()
-
-    # Add new_dir to base_tree
-    new_dir = new_dir.resolve()
-    s.base_tree.add_path(new_dir)
-    s.cur_path = new_dir
-    s.path_info.set_expanded(new_dir, True)
-
-    # Refresh base_tree
-    refresh_node(
-        s.base_tree,
-        s.base_tree.lookup(s.cur_path),
-        path_info = s.path_info.lookup_or_create(s.cur_path),
-        refresh = False,
-        error_callback = print_error,
-    )
-
-    new_name = make_buf_name(str(s.cur_path))
-    rename_nonfile_buffer(vim.current.buffer, new_name)
-    if update_pwd:
-        vim_cd(s.cur_path)
-
-
 def restore_alternate_buf(s: Session):
     if int(vim.eval(f"buflisted({s.alternate_buf})")):
         vim.command(f"let @# = {s.alternate_buf}")
@@ -167,24 +225,6 @@ def is_dir_empty(path: Path) -> bool:
     return True
 
 
-def update_buffer(tree: DirTree):
-    s = get_session(); assert s
-    was_modified = is_buf_modified()
-
-    with io.StringIO() as buf:
-        indent_offset = write_tree(CONFIG, buf, tree, tree.lookup(s.cur_path), s.path_info.try_lookup(s.cur_path))
-        buf.seek(0, io.SEEK_SET)
-        vim_set_buffer_contents(buf.readlines())
-
-        s.changedtick = vim_changetick()
-
-        first_tab_stop = indent_offset + CONFIG.node_state_symbol_width + 1 # +1 for the space following the node state symbol
-        vim.command(f"setl varsofttabstop={first_tab_stop},{CONFIG.indent_width}")
-        # There is also 'vartabstop' in case I want to support tabs for indentation
-
-    if not was_modified:
-        vim.command("setl nomodified")
-
 def print_error(msg: str):
     vim.command(f"echohl ErrorMsg | echo { escape_for_vim_expr('Error: ' + msg) } | echohl None")
 
@@ -200,6 +240,10 @@ def escape_fn_for_vim_cmd(text: str):
         raise Exception("fnameescape() failed")
 
     return esc
+
+
+def vim_changetick() -> int:
+    return int(vim.eval("b:changedtick"))
 
 
 def vim_set_buffer_contents(lines: list[str]):
@@ -359,13 +403,31 @@ def get_name_at(line: str) -> str:
 
 # Functions that are called from Vim
 #===============================================================================
+def open_logger():
+    buf_name = "Vfx Log"
+    if not is_buf_name_available(buf_name):
+        print("Log already open")
+        return
+
+    vim.command("vsplit " + escape_fn_for_vim_cmd("Vfx Log"))
+    vim.command('setlocal bufhidden=wipe')
+    vim.command('setlocal buftype=nofile')
+    vim.command('setlocal noswapfile')
+    vim.command('setlocal buflisted')
+
+    vim.command(r'syn match Type "\[.\+\]"')
+    vim.command(r'syn match Comment "#\d\+"')
+
+    LOG.init_buf(int(vim.eval("bufnr()")), CONFIG.log_level)
+    vim.command("wincmd p")
+
+
 # Initializes a new Vfx buffer
 def init():
     global SESSIONS, GLOBAL_TREE_STATE
 
     if GLOBAL_TREE_STATE.root_dir is None:
         GLOBAL_TREE_STATE.root_dir = Path.cwd()
-    buf_name = make_buf_name(str(GLOBAL_TREE_STATE.root_dir))
 
     # The directory buffer should have no influence on the alternative file.
     # To this end, we need to update the alt file in two situations:
@@ -383,24 +445,29 @@ def init():
     alt_buf = int(vim.eval('bufnr("#")'))
     replaced_buf = int(vim.eval('bufnr("%")'))
 
+    if CONFIG.enable_log:
+        open_logger()
+
     # Create new buffer and set options
     # Initially, I was using `bufadd()` instead of `:edit` but this leaves the
     # "[No Name]" buffer behind. `:edit` on the other hand automatically closes
     # that buffer if it is empty.
+    buf_name = make_buf_name(str(GLOBAL_TREE_STATE.root_dir))
     vim.command("edit " + escape_fn_for_vim_cmd(buf_name))
+    buf_no = int(vim.current.buffer.number)
+
     vim.command('setlocal bufhidden=wipe')
     vim.command('setlocal buftype=acwrite')
     vim.command('setlocal noswapfile')
     vim.command('setlocal buflisted')
     vim.command('setlocal ft=vfx')
-
     vim.command("setlocal expandtab")
 
-    buf_no = int(vim.current.buffer.number)
-    path_info = GLOBAL_TREE_STATE.path_info.clone()
-    path_info.set_expanded(GLOBAL_TREE_STATE.root_dir, True)
+    vim.eval(f'prop_type_add("vfx_change", {{"bufnr": {buf_no}, "highlight": "Changed"}})')
+    vim.eval(f'prop_type_add("vfx_remove", {{"bufnr": {buf_no}, "highlight": "Removed"}})')
+    vim.eval(f'prop_type_add("vfx_error", {{"bufnr": {buf_no}, "highlight": "Error"}})')
 
-    SESSIONS[buf_no] = Session(
+    s = Session(
         buf_no = buf_no,
         alternate_buf = alt_buf,
         replaced_buf = replaced_buf,
@@ -409,24 +476,24 @@ def init():
             GLOBAL_TREE_STATE.show_details,
             GLOBAL_TREE_STATE.show_dotfiles
         ),
+        buf_tree = DirTree(
+            GLOBAL_TREE_STATE.root_dir,
+            GLOBAL_TREE_STATE.show_details,
+            GLOBAL_TREE_STATE.show_dotfiles
+        ),
         cur_path = GLOBAL_TREE_STATE.root_dir,
-        path_info = path_info,
-        changedtick = 0,
+        path_info = GLOBAL_TREE_STATE.path_info.clone(),
     )
 
-
-    vim.eval(f'prop_type_add("vfx_change", {{"bufnr": {buf_no}, "highlight": "Changed"}})')
-    vim.eval(f'prop_type_add("vfx_remove", {{"bufnr": {buf_no}, "highlight": "Removed"}})')
-    vim.eval(f'prop_type_add("vfx_error", {{"bufnr": {buf_no}, "highlight": "Error"}})')
-
-    s = SESSIONS[buf_no]
-    refresh_node(s.base_tree, s.base_tree.root, s.path_info.lookup_or_create(s.base_tree.root_dir()), refresh=True, error_callback=print_error)
-    update_buffer(s.base_tree)
+    s.path_info.set_expanded(GLOBAL_TREE_STATE.root_dir, True)
+    s.update_base_tree()
+    s.update_buf_tree()
+    s.update_vim_buffer()
 
     vim_set_line_no(GLOBAL_TREE_STATE.cursor_line)
     vim_set_column_no(GLOBAL_TREE_STATE.cursor_column)
 
-    s.changedtick = vim_changetick()
+    SESSIONS[buf_no] = s
 
 
 def quit():
@@ -457,29 +524,29 @@ def quit():
 
 def open_entry(split_window: bool = False):
     s = get_session(); assert s
-    buf_tree = update_session_from_buf__return_tree(s)
+    s.update_from_buf()
 
     filepath = s.cur_path / get_path_at(vim_get_line_no())
     if filepath.is_dir():
-        change_dir(s, filepath)
-        update_buf_tree_from_base(buf_tree, s.cur_path, s.base_tree, s.path_info, s.mods_by_id)
-        update_buffer(buf_tree)
+        s.change_dir(filepath)
+        s.update_vim_buffer()
     elif filepath.is_file():
         default_app = default_app_for(filepath)
         if should_open_in_vim(default_app):
             open_filepath = filepath
             cwd = vim.eval("getcwd()")
+            edit_cmd = "edit"
             if filepath.is_relative_to(cwd):
                 open_filepath = filepath.relative_to(cwd)
             if split_window:
                 cur_win = int(vim.eval("winnr()"))
                 prev_win = int(vim.eval("winnr('#')"))
                 if prev_win == 0 or prev_win == cur_win:
-                    vim.command("vsplit")
+                    edit_cmd = "vsplit"
                 else:
                     vim.command(f"{prev_win}wincmd w")
 
-            vim.command("keepalt edit " + escape_fn_for_vim_cmd(str(open_filepath)))
+            vim.command(f"keepalt {edit_cmd} " + escape_fn_for_vim_cmd(str(open_filepath)))
         else:
             xdg_open_bin = shutil.which("xdg-open")
             if xdg_open_bin is None:
@@ -497,52 +564,53 @@ def open_vim_cwd():
 
 def change_vim_cwd():
     s = get_session(); assert s
-    buf_tree = update_session_from_buf__return_tree(s)
-    change_dir(s, Path(vim.eval("getcwd()")))
-    update_buf_tree_from_base(buf_tree, s.cur_path, s.base_tree, s.path_info, s.mods_by_id)
-    update_buffer(buf_tree)
+    s.update_from_buf()
+    s.change_dir(Path(vim.eval("getcwd()")))
+    s.update_vim_buffer()
 
 
 def move_up():
     s = get_session(); assert s
-    buf_tree = update_session_from_buf__return_tree(s)
-    change_dir(s, s.cur_path.parent)
-    update_buf_tree_from_base(buf_tree, s.cur_path, s.base_tree, s.path_info, s.mods_by_id)
-    update_buffer(buf_tree)
+    s.update_from_buf()
+    s.change_dir(s.cur_path.parent)
+    s.update_vim_buffer()
 
 
 def toggle_expand():
     s = get_session(); assert s
-    buf_tree = update_session_from_buf__return_tree(s)
-    node = buf_tree.try_lookup(get_path_at(vim_get_line_no()))
-    if node is None or not node.is_dir() or node.is_new():
-        return
+    s.update_from_buf()
 
-    s.path_info.set_expanded(node.abs_filepath(), not node.is_expanded)
+    node = s.buf_tree.try_lookup(get_path_at(vim_get_line_no()))
+    if node is not None and node.is_dir() and node.is_known():
+        abs_filepath = node.abs_filepath()
+        s.path_info.set_expanded(abs_filepath, not node.is_expanded)
 
-    update_base_tree_from_buf(s.base_tree, buf_tree, s.path_info, error_callback=print_error)
-    update_buf_tree_from_base(buf_tree, s.cur_path, s.base_tree, s.path_info, s.mods_by_id)
-    update_buffer(buf_tree)
+        if not s.base_tree.is_expanded_at(abs_filepath):
+            s.update_base_tree()
+
+        # TODO If buf_tree is changed we need to update its DirNode.line_nos
+        s.update_buf_tree()
+        s.update_vim_buffer()
 
 
 def toggle_dotfiles():
     s = get_session(); assert s
-    buf_tree = update_session_from_buf__return_tree(s)
-    buf_tree.has_dotfiles = not buf_tree.has_dotfiles
+    s.update_from_buf()
+    s.buf_tree.has_dotfiles = not s.buf_tree.has_dotfiles
 
-    update_base_tree_from_buf(s.base_tree, buf_tree, s.path_info, error_callback=print_error)
-    update_buf_tree_from_base(buf_tree, s.cur_path, s.base_tree, s.path_info, s.mods_by_id)
-    update_buffer(buf_tree)
+    s.update_base_tree()
+    s.update_buf_tree()
+    s.update_vim_buffer()
 
 
 def toggle_details():
     s = get_session(); assert s
-    buf_tree = update_session_from_buf__return_tree(s)
-    buf_tree.has_details = not buf_tree.has_details
+    s.update_from_buf()
+    s.buf_tree.has_details = not s.buf_tree.has_details
 
-    update_base_tree_from_buf(s.base_tree, buf_tree, s.path_info, error_callback=print_error)
-    update_buf_tree_from_base(buf_tree, s.cur_path, s.base_tree, s.path_info, s.mods_by_id)
-    update_buffer(buf_tree)
+    s.update_base_tree()
+    s.update_buf_tree()
+    s.update_vim_buffer()
 
 
 # For internal use only. Called when the BufWriteCmd autocmd event is fired.
@@ -621,24 +689,8 @@ def toggle_details():
 #            update_buffer()
 
 
-def display_changes():
-    # TODO Use b:changetick to only recompute the changes if the buffer has changed
-
-    s = get_session(); assert s
-    buf_tree = update_session_from_buf__return_tree(s)
-    mods = compute_changes(s.base_tree, buf_tree)
-    s.mods_by_id = get_mods_by_id(mods)
-    vim.eval('prop_clear(1, line("$"))')
-    for mod in mods:
-        for op in mod.get_ops():
-            if op["kind"] == "delete":
-                add_text_prop(1, op_to_str(op), align="above", style="vfx_remove")
-            elif op["kind"] == "create":
-                add_text_prop(op['node'].line_no, op_to_str(op), style="vfx_change")
-            elif op["kind"] in ["move", "copy"]:
-                add_text_prop(op['dest_node'].line_no, op_to_str(op), style="vfx_change")
-
-
+# For internal use only. Called whenever the vim buffer has been changed.
+def buffer_changed():
     def display_errors(node: DirNode):
         if node.error:
             if node.line_no is None:
@@ -650,7 +702,25 @@ def display_changes():
             for child in node.children:
                 display_errors(child)
 
-    display_errors(buf_tree.root)
+
+    s = get_session(); assert s
+    with LOG.scope("Buffer changed") as scope:
+        if s.update_from_buf():
+            # Display modifications/errors
+            vim.eval('prop_clear(1, line("$"))')
+            for mod in s.mods:
+                for op in mod.get_ops():
+                    if op["kind"] == "delete":
+                        add_text_prop(1, op_to_str(op), align="above", style="vfx_remove")
+                    elif op["kind"] == "create":
+                        add_text_prop(op['node'].line_no, op_to_str(op), style="vfx_change")
+                    elif op["kind"] in ["move", "copy"]:
+                        add_text_prop(op['dest_node'].line_no, op_to_str(op), style="vfx_change")
+
+            display_errors(s.buf_tree.root)
+
+        else:
+            scope.info_add(" (skipped)")
 
 
 # For internal use only. Called when the BufUnload autocmd event is fired.
@@ -692,23 +762,3 @@ def get_indent_for_vim(line_no: int) -> int:
         return segments.node_state.start + 2 # +1 for the conceal-character and +1 for the following space
     else:
         return segments.name.start
-
-
-class Logger:
-    buf_no: int
-
-    def info(self, msg: str):
-        vim.buffers[self.buf_no].append(msg)
-
-
-def open_logger():
-    buf_name = "Vfx Log"
-    if not is_buf_name_available(buf_name):
-        print("Log already open")
-        return
-
-    vim.command("vsplit " + escape_fn_for_vim_cmd("Vfx Log"))
-    vim.command('setlocal bufhidden=wipe')
-    vim.command('setlocal buftype=acwrite')
-    vim.command('setlocal noswapfile')
-    vim.command('setlocal buflisted')

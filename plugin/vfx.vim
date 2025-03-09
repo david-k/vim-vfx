@@ -25,8 +25,8 @@ EOF
 
 	autocmd BufUnload <buffer> py3 vfx.on_buf_unload()
 	autocmd BufWriteCmd <buffer> py3 vfx.on_buf_save()
-	autocmd InsertLeave <buffer> py3 vfx.display_changes()
-	autocmd TextChanged <buffer> py3 vfx.display_changes()
+	autocmd InsertLeave <buffer> py3 vfx.buffer_changed()
+	autocmd TextChanged <buffer> py3 vfx.buffer_changed()
 	autocmd DirChanged window py3 vfx.change_vim_cwd()
 
 	" TODO Define `autocmd FileExplorer`. This makes it possible to do `:edit <DIRECTORY>` like netrw

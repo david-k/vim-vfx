@@ -1,5 +1,6 @@
 from enum import Enum
 from dataclasses import dataclass
+from logger import LogLevel
 
 
 class NodeState(Enum):
@@ -14,6 +15,8 @@ class Config:
     indent_width: int
     node_state_symbols: dict[NodeState, str]
     node_state_symbol_width: int
+    enable_log: bool
+    log_level: LogLevel
 
 
 def default_config() -> Config:
@@ -29,4 +32,7 @@ def default_config() -> Config:
 
         # All node_state_symbols must consist of the same number of glyphs
         node_state_symbol_width = 1,
+
+        enable_log = False,
+        log_level = LogLevel.INFO,
     )

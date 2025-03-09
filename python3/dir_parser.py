@@ -13,6 +13,7 @@ from typing import (
 
 from config import Config, NodeState
 from dir_tree import *
+from logger import LOG
 
 
 # Parser
@@ -210,17 +211,18 @@ class NewNode:
 
 
 def parse_buffer(config: Config, lines: list[str]) -> DirTree:
-    assert NUM_LINES_BEFORE_TREE == 1
-    options = parse_options(lines[0])
-    tree = parse_tree(config,
-        options["path"],
-        options["show_details"],
-        options["show_dotfiles"],
-        lines[1:],
-        line_offset=1
-    )
-    tree.root.id = NodeIDKnown(options["root_id"])
-    return tree
+    with LOG.scope("Parsing buffer"):
+        assert NUM_LINES_BEFORE_TREE == 1
+        options = parse_options(lines[0])
+        tree = parse_tree(config,
+            options["path"],
+            options["show_details"],
+            options["show_dotfiles"],
+            lines[1:],
+            line_offset=1
+        )
+        tree.root.id = NodeIDKnown(options["root_id"])
+        return tree
 
 
 def parse_options(line: str):
