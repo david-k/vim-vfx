@@ -706,7 +706,17 @@ def _update_buf_node_from_base(
     mods_by_id: dict[NodeIDKnown, Modification],
 ):
     assert buf_node.id == fs_node.id
-    assert Path(buf_node.name).name == Path(fs_node.name).name
+
+    # Only update buf_node.name if there are no modifications for that node.
+    # REVISIT: I think we *should* update buf_node.name whenever was not renamed in the buffer. For
+    #          example, if buf_node.name is the same but buf_node.parent has changed, then we sould
+    #          update buf_node.name.
+    mod = mods_by_id.get(buf_node.id) if isinstance(buf_node.id, NodeIDKnown) else None
+    if mod is None:
+        if buf_node.is_root():
+            buf_node.name = str(fs_node.abs_filepath())
+        else:
+            buf_node.name = fs_node.name
 
     buf_node.kind = fs_node.kind
     buf_node.details = fs_node.details.copy() if fs_node.details else None
@@ -731,12 +741,14 @@ def _update_buf_node_from_base(
                 assert isinstance(buf_child_.id, NodeIDKnown)
                 fs_child_ = fs_nodes_by_id.get(buf_child_.id)
 
+                # REVISIT: What happens if you rename a file such that it starts with a dot? Does it
+                #          then just disappear in case show_dotfiles=False?
                 if fs_child_ is None or (buf_child_.name.startswith(".") and not show_dotfiles):
                     buf_node.children.pop(idx)
                     continue
 
                 if fs_child_:
-                    _update_buf_node_from_base(buf_child_, fs_child_, show_dotfiles, get_child(path_info, buf_child_.name), fs_nodes_by_id, mods_by_id)
+                    _update_buf_node_from_base(buf_child_, fs_child_, show_dotfiles, get_child(path_info, fs_child_.name), fs_nodes_by_id, mods_by_id)
 
                 idx += 1
 
@@ -754,7 +766,7 @@ def _update_buf_node_from_base(
                     # Only insert the child node if it has not been deleted
                     if not mod or not mod.delete_orig:
                         buf_child = fs_child.copy_without_children(parent=buf_node)
-                        _update_buf_node_from_base(buf_child, fs_child, show_dotfiles, get_child(path_info, buf_child.name), fs_nodes_by_id, mods_by_id)
+                        _update_buf_node_from_base(buf_child, fs_child, show_dotfiles, get_child(path_info, fs_child.name), fs_nodes_by_id, mods_by_id)
 
                         buf_child_idx = bisect.bisect(buf_node.children, node_sort_key(fs_child), key = node_sort_key)
                         buf_node.children.insert(buf_child_idx, buf_child)
