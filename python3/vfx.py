@@ -190,6 +190,8 @@ class Session:
     # incorporate the new information.
     def update_buf_tree(self):
         update_buf_tree_from_base(self.buf_tree, self.cur_path, self.base_tree, self.path_info, self.mods_by_id)
+        with log.scope("Recompute line numbers"):
+            self.buf_tree.root.recompute_line_numbers(NUM_LINES_BEFORE_TREE)
 
 
     # Writes buf_tree to the Vim buffer
@@ -648,7 +650,6 @@ def toggle_expand():
         if not s.base_tree.is_expanded_at(abs_filepath):
             s.update_base_tree()
 
-        # TODO If buf_tree is changed we need to update its DirNode.line_nos
         s.update_buf_tree()
         s.update_vim_buffer()
 
@@ -765,22 +766,19 @@ def buffer_changed():
 
     s = get_session(); assert s
     with log.scope("Buffer changed") as scope:
-        if s.update_from_buf():
-            # Display modifications/errors
-            vim.eval('prop_clear(1, line("$"))')
-            for mod in s.mods:
-                for op in mod.get_ops():
-                    if op["kind"] == "delete":
-                        add_text_prop(1, op_to_str(op), align="above", style="vfx_remove")
-                    elif op["kind"] == "create":
-                        add_text_prop(op['node'].line_no, op_to_str(op), style="vfx_change")
-                    elif op["kind"] in ["move", "copy"]:
-                        add_text_prop(op['dest_node'].line_no, op_to_str(op), style="vfx_change")
+        s.update_from_buf()
+        # Display modifications/errors
+        vim.eval('prop_clear(1, line("$"))')
+        for mod in s.mods:
+            for op in mod.get_ops():
+                if op["kind"] == "delete":
+                    add_text_prop(1, op_to_str(op), align="above", style="vfx_remove")
+                elif op["kind"] == "create":
+                    add_text_prop(op['node'].line_no, op_to_str(op), style="vfx_change")
+                elif op["kind"] in ["move", "copy"]:
+                    add_text_prop(op['dest_node'].line_no, op_to_str(op), style="vfx_change")
 
-            display_errors(s.buf_tree.root)
-
-        else:
-            scope.info_add(" (skipped)")
+        display_errors(s.buf_tree.root)
 
 
 # For internal use only. Called when the BufUnload autocmd event is fired.

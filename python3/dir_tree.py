@@ -177,6 +177,15 @@ class DirNode:
         return errors
 
 
+    def recompute_line_numbers(self, cur_line_no: int) -> int:
+        self.line_no = cur_line_no
+        cur_line_no += 1
+        for child in self.children:
+            cur_line_no = child.recompute_line_numbers(cur_line_no)
+
+        return cur_line_no
+
+
 def node_sort_key(node: DirNode) -> tuple[bool, str]:
     return (not node.is_dir(), node.name)
 
