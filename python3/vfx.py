@@ -255,8 +255,16 @@ def on_exit(s: Session):
 
 
 def restore_alternate_buf(s: Session):
-    if int(vim.eval(f"buflisted({s.alternate_buf})")):
-        vim.command(f"let @# = {s.alternate_buf}")
+    def try_set_alt_buf(buf_no: int):
+        if int(vim.eval(f"buflisted({buf_no})")):
+            vim.command(f"let @# = {buf_no}")
+
+
+    cur_buf_no = int(vim.eval("bufnr()"))
+    if cur_buf_no == s.replaced_buf:
+        try_set_alt_buf(s.alternate_buf)
+    else:
+        try_set_alt_buf(s.replaced_buf)
 
 
 def default_app_for(filename: Path) -> str:
