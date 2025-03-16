@@ -167,13 +167,13 @@ class EntryOffset:
         offset = EntryOffset()
 
         if segments.node_state is None:
-            # Even if there is no node state we calculate the indentation as if there was
-            offset.entry_offset = segments.name.start - config.node_state_symbol_width - 1
+            offset.entry_offset = segments.name.start
         else:
-            offset.entry_offset = segments.node_state.start
+            # Even if there is a node state we calculate the indentation as if there wasn't
+            offset.entry_offset = segments.node_state.start + config.node_state_symbol_width + 1
 
         if segments.details is not None:
-            offset.rebase(segments.details.end)
+            offset.rebase(segments.details.end + NUM_SPACES_IGNORED_AFTER_DETAILS)
 
         return offset
 
@@ -185,7 +185,7 @@ class EntryOffset:
     def rebase(self, new_base_offset: int):
         assert self.base_offset is None # Ignore this case as I don't need it
         self.base_offset = new_base_offset
-        self.entry_offset = max(self.entry_offset - self.base_offset - NUM_SPACES_IGNORED_AFTER_DETAILS, 0)
+        self.entry_offset = max(self.entry_offset - self.base_offset, 0)
 
 
     def _abs_offset(self, other_base_offset: Optional[int]) -> int:

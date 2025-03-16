@@ -567,6 +567,7 @@ f"""
 [-rw-r--r-- david david  0.0 2025-01-28 10:31] |5_ subfile
                                                  so/
                                                      ho
+                                                 hmm/
 """
 )
     #parse_buffer(default_config(), scenario2.strip().splitlines()).print()
