@@ -21,7 +21,7 @@ class Config:
 
 def default_config() -> Config:
     return Config(
-        confirm_changes = False,
+        confirm_changes = True,
         indent_width = 4,
 
         node_state_symbols = {

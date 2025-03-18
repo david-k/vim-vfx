@@ -32,7 +32,9 @@ import log
 
 # TODO Test edge case: Changing a directory to a file with the same name (and vice versa)
 
-# TODO Use listener_add() to listen for changes to the buffer so we don't need to reparse everything
+# TODO[FEATURE] Use listener_add() to listen for changes to the buffer so we don't need to reparse everything
+
+# TODO[BUG] If you rename a file, save the changes, then undo, you'll get an error (invalid node id)
 
 
 # Logger
@@ -637,7 +639,8 @@ def open_entry(split_window: bool = False):
 
 def open_vim_cwd():
     s = get_session(); assert s
-    vim_cd(s.base_tree.root_dir())
+    vim_cd(s.buf_tree.root_dir())
+    print(f"cd {s.buf_tree.root_dir()}")
 
 
 def change_vim_cwd():
@@ -657,6 +660,10 @@ def move_up():
 def toggle_expand():
     s = get_session(); assert s
     s.update_from_buf()
+
+    # TODO Expanding/collapsing a node that has been renamed fails. This can be fixed by looking up
+    #      the `fs_node` that has the same ID as `node` and using `fs_node.abs_filepath()` instead
+    #      of `node.abs_filepath()`.
 
     node = s.buf_tree.try_lookup(get_path_at(vim_get_line_no()))
     if node is not None and node.is_dir() and node.is_known():
@@ -691,79 +698,80 @@ def toggle_details():
 
 
 # For internal use only. Called when the BufWriteCmd autocmd event is fired.
-#def on_buf_save():
-#    if is_buf_modified():
-#        s = get_session(); assert s
-#
-#        node_changes = compute_node_changes(s.view, vim.current.buffer, s.indent_offset)
-#        operations = compute_operations(node_changes)
-#        if not operations:
-#            vim.command("setl nomodified") # Don't mark the buffer as modified
-#            return
-#
-#        apply_changes = True
-#        if CONFIG.confirm_changes:
-#            for op in operations:
-#                print(op_to_str(op))
-#
-#            choice = int(vim.eval('confirm("Apply changes?", "yes\nno", 2)'))
-#            apply_changes = choice == 1
-#
-#        if apply_changes:
-#            buffers_by_name = {buf.name: buf for buf in vim.buffers if buf.valid}
-#            for op in operations:
-#                if op["kind"] == "NEW":
-#                    filepath = s.view.root_dir() / op["node"].filepath()
-#                    if op["node"].is_file():
-#                        if filepath.exists():
-#                            print("Error: destination already exists: " + str(filepath))
-#                            print("Aborting")
-#                            return
-#                        else:
-#                            filepath.touch()
-#                    else:
-#                        filepath.mkdir(parents=True)
-#
-#                elif op["kind"] == "REMOVE":
-#                    filepath = s.view.root_dir() / op["node"].filepath()
-#                    subprocess.run(["trash", "--", filepath])
-#
-#                elif op["kind"] == "COPY":
-#                    old_filepath = s.view.root_dir() / op["old_node"].filepath()
-#                    new_filepath = s.view.root_dir() / op["new_node"].filepath()
-#                    if new_filepath.exists():
-#                        print("Error: destination already exists: " + str(new_filepath))
-#                        print("Aborting")
-#                        return
-#                    else:
-#                        if op["old_node"].is_file():
-#                            shutil.copyfile(old_filepath, new_filepath, follow_symlinks=False)
-#                        else:
-#                            shutil.copytree(old_filepath, new_filepath, symlinks=True)
-#
-#                elif op["kind"] == "MOVE":
-#                    old_filepath = s.view.root_dir() / op["old_node"].filepath()
-#                    new_filepath = s.view.root_dir() / op["new_node"].filepath()
-#                    if new_filepath.exists():
-#                        print("Error: destination already exists: " + str(new_filepath))
-#                        print("Aborting")
-#                        return
-#                    else:
-#                        # TODO When renaming a directory, we need to rename all open child buffers
-#
-#                        # For the lookup to work old_filepath needs to denote an absolute path
-#                        buffer = buffers_by_name.get(str(old_filepath))
-#                        if buffer is None:
-#                            old_filepath.rename(new_filepath)
-#                        else:
-#                            move_file(buffer, new_filepath)
-#
-#                else:
-#                    raise Exception("Unsupported op: " + op["kind"])
-#
-#
-#            s.view.refresh_from_fs()
-#            update_buffer()
+def on_buf_save():
+    s = get_session(); assert s
+    s.update_from_buf()
+
+    operations = sort_operations([op for mod in s.mods for op in mod.get_ops()])
+    if not operations:
+        vim.command("setl nomodified")
+        return
+
+    apply_changes = True
+    if CONFIG.confirm_changes:
+        for op in operations:
+            print(op_to_str(op))
+
+        choice = int(vim.eval('confirm("Apply changes?", "yes\nno", 2)'))
+        apply_changes = choice == 1
+
+    if apply_changes:
+        buffers_by_name = {buf.name: buf for buf in vim.buffers if buf.valid}
+        for op in operations:
+            if op["kind"] == "create":
+                filepath = op["node"].abs_filepath()
+                if op["node"].is_file():
+                    if filepath.exists():
+                        print("Error: destination already exists: " + str(filepath))
+                        print("Aborting")
+                        return
+                    else:
+                        filepath.touch()
+                else:
+                    filepath.mkdir()
+
+            elif op["kind"] == "delete":
+                filepath = op["node"].abs_filepath()
+                subprocess.run(["trash", "--", filepath])
+
+            elif op["kind"] == "copy":
+                old_filepath = op["src_node"].abs_filepath()
+                new_filepath = op["dest_node"].abs_filepath()
+                if new_filepath.exists():
+                    print("Error: destination already exists: " + str(new_filepath))
+                    print("Aborting")
+                    return
+                else:
+                    if op["src_node"].is_file():
+                        shutil.copyfile(old_filepath, new_filepath, follow_symlinks=False)
+                    else:
+                        shutil.copytree(old_filepath, new_filepath, symlinks=True)
+
+            elif op["kind"] == "move":
+                old_filepath = op["src_node"].abs_filepath()
+                new_filepath = op["dest_node"].abs_filepath()
+                if new_filepath.exists():
+                    print("Error: destination already exists: " + str(new_filepath))
+                    print("Aborting")
+                    return
+                else:
+                    # TODO When renaming a directory, we need to rename all open child buffers
+
+                    # For the lookup to work old_filepath needs to denote an absolute path
+                    buffer = buffers_by_name.get(str(old_filepath))
+                    if buffer is None:
+                        old_filepath.rename(new_filepath)
+                    else:
+                        move_file(buffer, new_filepath)
+
+            else:
+                assert False, "Unsupported op"
+
+
+        s.update_base_tree(refresh=True)
+        s.reset_buf_tree()
+        s.update_vim_buffer()
+        vim.command("setl nomodified")
 
 
 # For internal use only. Called whenever the vim buffer has been changed.

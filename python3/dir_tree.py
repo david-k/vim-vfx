@@ -854,13 +854,195 @@ def get_mods_by_id(mods: list[Modification]) -> dict[NodeIDKnown, Modification]:
     return {mod.orig_node.id: mod for mod in mods if mod.orig_node and isinstance(mod.orig_node.id, NodeIDKnown)}
 
 
+# Compute operation dependencies
+#-----------------------------------------------------------
+class PathDepNode:
+    children: dict[str, "PathDepNode"]
+    created_by: Optional[int]
+    removed_by: Optional[int]
+    read_by: list[int]
+
+    def __init__(self):
+        self.children = {}
+        self.created_by = None
+        self.removed_by = None
+        self.read_by = []
+
+    def set_creator(self, creator: int):
+        assert self.created_by is None
+        self.created_by = creator
+
+    def set_remover(self, remover: int):
+        assert self.removed_by is None
+        self.removed_by = remover
+
+    def add_reader(self, reader: int):
+        self.read_by.append(reader)
+
+    def print(self, indent: int):
+        print(f"creator={self.created_by}, remover={self.removed_by}, reader={self.read_by}")
+        for child_name, child_node in self.children.items():
+            print(" " * (indent*4) + child_name, end=" ")
+            child_node.print(indent+1)
+
+
+
+class PathDepTree:
+    root: PathDepNode
+
+    def __init__(self):
+        self.root = PathDepNode()
+
+    def lookup(self, path: Path) -> "PathDepNode":
+        assert path.is_absolute()
+
+        path_parts = list(path.parts)[1:]
+        cur_node = self.root
+        while len(path_parts) > 0:
+            cur_node = cur_node.children.setdefault(path_parts.pop(0), PathDepNode())
+
+        return cur_node
+
+    def print(self):
+        self.root.print(0)
+
+
+def _compute_deps(
+    # Inputs:
+    node: PathDepNode,
+    parent_creator: Optional[int],
+    parent_remover: Optional[int],
+    parent_readers: list[int],
+    ops: list[dict],
+    # Outputs:
+    deps: dict[int, list[int]],
+):
+    if node.created_by is not None:
+        if parent_creator is not None:
+            deps.setdefault(node.created_by, []).append(parent_creator)
+
+        # If we copy a parent we first want to create all its children
+        for parent_reader in parent_readers:
+            deps.setdefault(parent_reader, []).append(node.created_by)
+
+        # If a node is both removed and created, we interpret this as removing the existing
+        # file/folder and *then* creating a new one with the same name. To enforce this order, we
+        # add a corresponding dependency.
+        if node.removed_by is not None:
+            deps.setdefault(node.created_by, []).append(node.removed_by)
+
+    if node.removed_by is not None:
+        if parent_remover is not None:
+            deps.setdefault(parent_remover, []).append(node.removed_by)
+
+        # If we copy a parent we first want to perform all child deletions
+        for parent_reader in parent_readers:
+            deps.setdefault(parent_reader, []).append(node.removed_by)
+
+    # If we delete a parent we first want to copy its children
+    if parent_remover is not None:
+        for reader in node.read_by:
+            deps.setdefault(parent_remover, []).append(reader)
+
+    if parent_creator is not None:
+        for reader in node.read_by:
+            deps.setdefault(reader, []).append(parent_creator)
+
+    for child in node.children.values():
+        _compute_deps(
+            child,
+            node.created_by if node.created_by is not None else parent_creator,
+            node.removed_by if node.removed_by is not None else parent_remover,
+            node.read_by or parent_readers,
+            ops,
+            deps
+        )
+
+
+def compute_deps(tree: PathDepTree, ops: list[dict]) -> dict[int, list[int]]:
+    parent_creator: Optional[int] = None
+    parent_remover: Optional[int] = None
+    parent_readers: list[int] = []
+    deps: dict[int, list[int]] = {}
+    _compute_deps(tree.root, parent_creator, parent_remover, parent_readers, ops, deps)
+    return deps
+
+
+class SortState(Enum):
+    UNKNOWN = 0
+    IN_PROGRESS = 1
+    DONE = 2
+
+
+def _topological_sort(
+    op: int,
+    deps: dict[int, list[int]],
+    visited: dict[int, SortState],
+    result: list[int]
+):
+    state = visited.get(op, SortState.UNKNOWN)
+    if state == SortState.DONE:
+        return
+    elif state == SortState.IN_PROGRESS:
+        raise Exception("Dependencies between operations are cyclic")
+
+    visited[op] = SortState.IN_PROGRESS
+    for dep in deps.get(op, []):
+        _topological_sort(dep, deps, visited, result)
+
+    visited[op] = SortState.DONE
+    result.append(op)
+
+
+def topological_sort(ops: list[int], deps: dict[int, list[int]]) -> list[int]:
+    result: list[int] = []
+    visited: dict[int, SortState] = {}
+
+    for op in ops:
+        _topological_sort(op, deps, visited, result)
+
+    return result
+
+
+
+def sort_operations(ops: list[dict]) -> list[dict]:
+    tree = PathDepTree()
+
+    for idx, op in enumerate(ops):
+        if op["kind"] == "create":
+            tree.lookup(op["node"].abs_filepath()).set_creator(idx)
+        elif op["kind"] == "delete":
+            tree.lookup(op["node"].abs_filepath()).set_remover(idx)
+        elif op["kind"] == "copy":
+            tree.lookup(op["src_node"].abs_filepath()).add_reader(idx)
+            tree.lookup(op["dest_node"].abs_filepath()).set_creator(idx)
+        elif op["kind"] == "move":
+            tree.lookup(op["src_node"].abs_filepath()).set_remover(idx)
+            tree.lookup(op["dest_node"].abs_filepath()).set_creator(idx)
+        else:
+            assert False, "Invalid op kind"
+
+    deps = compute_deps(tree, ops)
+    sorted_ops: list[dict] = []
+    for op_idx in topological_sort(list(range(len(ops))), deps):
+        sorted_ops.append(ops[op_idx])
+
+    return sorted_ops
+
+
+
 # Filesystem operations
 #===============================================================================
 def get_child(path_node: Optional[PathInfoNode], child: str) -> Optional[PathInfoNode]:
     if path_node is None:
         return None
 
-    return path_node.children.get(child)
+    if child_node := path_node.children.get(child):
+        return child_node
+
+    # If the child could not be found it means it is not expanded. Thus, return a non-expanded
+    # default node.
+    return PathInfoNode()
 
 
 class RefreshStats:
