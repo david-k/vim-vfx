@@ -194,6 +194,14 @@ class Session:
             self.buf_tree.root.recompute_line_numbers(NUM_LINES_BEFORE_TREE)
 
 
+    def reset_buf_tree(self):
+        self.buf_tree.clear()
+        self.update_buf_tree()
+
+        self.mods = compute_changes(self.base_tree, self.buf_tree)
+        self.mods_by_id = get_mods_by_id(self.mods)
+
+
     # Writes buf_tree to the Vim buffer
     def update_vim_buffer(self):
         was_modified = is_buf_modified()

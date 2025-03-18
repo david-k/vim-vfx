@@ -219,6 +219,11 @@ class DirTree:
         )
 
 
+    def clear(self):
+        self.root.children.clear()
+        self.root.is_expanded = False
+
+
     def root_dir(self) -> Path:
         return Path(self.root.name)
 
