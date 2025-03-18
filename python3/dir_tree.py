@@ -54,7 +54,7 @@ class NodeDetails:
         )
 
 
-@dataclass
+@dataclass(eq=False)
 class DirNode:
     id: NodeID
     name: str # Only the root node is allowed to contain path separators
@@ -129,19 +129,6 @@ class DirNode:
         else:
             self.error += " | " + msg
 
-    def get_child_idx(self, id: NodeID) -> int:
-        for idx, node in enumerate(self.children):
-            if node.id == id:
-                return idx
-
-        raise Exception("No child found that has given ID")
-
-
-    def remove_child(self, id: NodeID) -> "DirNode":
-        node = self.children.pop(self.get_child_idx(id))
-        node.parent = None
-        return node
-
 
     def seq_no(self) -> int:
         match self.id:
@@ -175,6 +162,25 @@ class DirNode:
 
         gather_errors_rec(self)
         return errors
+
+
+    def get_child_idx(self, id: NodeID) -> int:
+        for idx, node in enumerate(self.children):
+            if node.id == id:
+                return idx
+
+        raise Exception("No child found that has given ID")
+
+
+    def remove_child_by_id(self, id: NodeID) -> "DirNode":
+        node = self.children.pop(self.get_child_idx(id))
+        node.parent = None
+        return node
+
+    def insert_child(self, child: "DirNode"):
+        child_idx = bisect.bisect(self.children, node_sort_key(child), key=node_sort_key)
+        self.children.insert(child_idx, child)
+        child.parent = self
 
 
     def recompute_line_numbers(self, cur_line_no: int) -> int:
@@ -296,6 +302,17 @@ class DirTree:
                 kind = NodeKind.DIRECTORY,
                 is_expanded = False,
             )
+
+
+    def mv(self, src: Path, dest: Path):
+        src_node = self.lookup(src)
+        src_node.name = dest.name
+
+        if src.parent != dest.parent:
+            if src_node.parent:
+                # PERFORMANCE: This can quickly become O(n²) when mv()ing many nodes
+                src_node.parent.remove_child_by_id(src_node.id)
+                self.lookup(dest.parent).insert_child(src_node)
 
 
     def is_expanded_at(self, p: Path) -> bool:
@@ -1008,24 +1025,26 @@ def topological_sort(ops: list[int], deps: dict[int, list[int]]) -> list[int]:
 def sort_operations(ops: list[dict]) -> list[dict]:
     tree = PathDepTree()
 
-    for idx, op in enumerate(ops):
-        if op["kind"] == "create":
-            tree.lookup(op["node"].abs_filepath()).set_creator(idx)
-        elif op["kind"] == "delete":
-            tree.lookup(op["node"].abs_filepath()).set_remover(idx)
-        elif op["kind"] == "copy":
-            tree.lookup(op["src_node"].abs_filepath()).add_reader(idx)
-            tree.lookup(op["dest_node"].abs_filepath()).set_creator(idx)
-        elif op["kind"] == "move":
-            tree.lookup(op["src_node"].abs_filepath()).set_remover(idx)
-            tree.lookup(op["dest_node"].abs_filepath()).set_creator(idx)
-        else:
-            assert False, "Invalid op kind"
+    with log.scope("Sort operations"):
+        for idx, op in enumerate(ops):
+            if op["kind"] == "create":
+                tree.lookup(op["node"].abs_filepath()).set_creator(idx)
+            elif op["kind"] == "delete":
+                tree.lookup(op["node"].abs_filepath()).set_remover(idx)
+            elif op["kind"] == "copy":
+                tree.lookup(op["src_node"].abs_filepath()).add_reader(idx)
+                tree.lookup(op["dest_node"].abs_filepath()).set_creator(idx)
+            elif op["kind"] == "move":
+                tree.lookup(op["src_node"].abs_filepath()).set_remover(idx)
+                tree.lookup(op["dest_node"].abs_filepath()).set_creator(idx)
+            else:
+                assert False, "Invalid op kind"
 
-    deps = compute_deps(tree, ops)
-    sorted_ops: list[dict] = []
-    for op_idx in topological_sort(list(range(len(ops))), deps):
-        sorted_ops.append(ops[op_idx])
+        deps = compute_deps(tree, ops)
+        sorted_ops: list[dict] = []
+        for op_idx in topological_sort(list(range(len(ops))), deps):
+            sorted_ops.append(ops[op_idx])
+            log.debug(f"{op_to_str(ops[op_idx])} {deps.get(op_idx, [])})")
 
     return sorted_ops
 
@@ -1045,10 +1064,12 @@ def get_child(path_node: Optional[PathInfoNode], child: str) -> Optional[PathInf
     return PathInfoNode()
 
 
+@dataclass
 class RefreshStats:
     num_file_queries: int = 0
     num_scandir_queries: int = 0
     num_nodes_visited: int = 0
+    modified_nodes: list[DirNode] = field(default_factory=list)
 
 
 def refresh_node(
@@ -1057,12 +1078,13 @@ def refresh_node(
     path_info: Optional[PathInfoNode],
     refresh: bool,
     error_callback: Callable[[str], None],
-):
+) -> list[DirNode]:
     with log.scope("Refresh node") as scope:
         stats = RefreshStats()
         stats.num_nodes_visited += 1
         _refresh_node(tree, node, path_info, refresh, error_callback, stats)
         scope.info_add(f" (nodes_visited={stats.num_nodes_visited}, fs_queries={stats.num_file_queries+stats.num_scandir_queries}, refresh={refresh})")
+        return stats.modified_nodes
 
 
 def _refresh_node(
@@ -1076,22 +1098,14 @@ def _refresh_node(
     if node.is_new():
         return
 
-    node_abspath = tree.root_dir() / node.filepath()
+    node_abspath = node.abs_filepath()
 
     # Newly inserted root nodes don't have their details set so we always load them if they are
     # missing
     if refresh or (node.details is None and tree.has_details):
+        if _refresh_node_itself(node, load_details = tree.has_details):
+            stats.modified_nodes.append(node)
         stats.num_file_queries += 1
-        info = _query_entry_info(node_abspath, load_details = tree.has_details)
-        node.is_executable = info["is_executable"]
-        node.link_target = info["link_target"]
-        node.link_status = info["link_status"]
-        node.details = info["details"]
-        node.kind = info["kind"]
-
-        if node.is_file():
-            node.children.clear()
-            node.is_expanded = False
 
     if node.is_dir():
         refresh_direct_children = (
@@ -1108,7 +1122,8 @@ def _refresh_node(
                     for entry in entries:
                         log.debug(f"ScandirNext {entry.path}")
                         stats.num_scandir_queries += 1
-                        child_node = nodes_by_name.get(entry.name)
+
+                        child_node = nodes_by_name.pop(entry.name, None)
                         node_is_fresh = child_node is None
                         if child_node is None:
                             stats.num_file_queries += 1
@@ -1126,6 +1141,7 @@ def _refresh_node(
                                 link_status = info["link_status"],
                                 details = info["details"],
                             )
+                            stats.modified_nodes.append(child_node)
 
                         refresh_child = refresh
                         if node_is_fresh:
@@ -1140,6 +1156,9 @@ def _refresh_node(
                     for child in node.children:
                         if child.seq_no() == -1:
                             child.id = tree.next_node_id()
+
+                    for deleted_node in nodes_by_name.values():
+                        stats.modified_nodes.append(deleted_node)
 
             except PermissionError as e:
                 # Ensure that we don't repeatedly report the same error whenever we refresh the tree
@@ -1161,67 +1180,35 @@ def _refresh_node(
             stats.num_nodes_visited += len(node.children)
 
 
-# def refresh_node(tree: DirTree, node: DirNode, expanded_dirs: Optional[set[Path]], error_callback: Callable[[str], None]):
-#     if node.is_new():
-#         return
+def _refresh_node_itself(node: DirNode, load_details: bool) -> bool:
+    changed = False
+    info = _query_entry_info(node.abs_filepath(), load_details)
 
-#     node_abspath = tree.root_dir() / node.filepath()
-#     info = _query_entry_info(node_abspath, load_details = tree.has_details)
-#     node.is_executable = info["is_executable"]
-#     node.link_target = info["link_target"]
-#     node.link_status = info["link_status"]
-#     node.details = info["details"]
-#     node.kind = info["kind"]
-#     if node.is_file():
-#         node.children.clear()
-#         node.is_expanded = False
+    if node.is_executable != info["is_executable"]:
+        node.is_executable = info["is_executable"]
+        changed = True
 
-#     if node.is_dir():
-#         should_be_expanded = node.is_expanded or (expanded_dirs is not None and node_abspath in expanded_dirs)
-#         if should_be_expanded:
-#             nodes_by_name: dict[str, DirNode] = {node.name: node for node in node.children}
-#             node.children.clear()
-#             node.is_expanded = True
+    if node.link_target != info["link_target"]:
+        node.link_target = info["link_target"]
+        changed = True
 
-#             try:
-#                 with os.scandir(node_abspath) as entries:
-#                     for entry in entries:
-#                         child_node = nodes_by_name.get(entry.name)
-#                         if child_node:
-#                             refresh_node(tree, child_node, expanded_dirs, error_callback)
-#                             node.children.append(child_node)
-#                         else:
-#                             info = _query_entry_info(Path(entry.path), tree.has_details)
-#                             child_node = DirNode(
-#                                 # We use a dummy ID here and only set the real ID after the children have
-#                                 # been sorted. This ensures deterministic assignment of IDs, which makes
-#                                 # testing easier.
-#                                 id = NodeIDKnown(-1),
-#                                 name = info["name"],
-#                                 kind = info["kind"],
-#                                 parent = node,
-#                                 is_executable = info["is_executable"],
-#                                 link_target = info["link_target"],
-#                                 link_status = info["link_status"],
-#                                 details = info["details"],
-#                             )
-#                             node.children.append(child_node)
+    if node.link_status != info["link_status"]:
+        node.link_status = info["link_status"]
+        changed = True
 
-#                     node.children.sort(key=node_sort_key)
+    if node.details != info["details"]:
+        node.details = info["details"]
+        changed = True
 
-#                     for child in node.children:
-#                         if child.seq_no() == -1:
-#                             child.id = tree.next_node_id()
+    if node.kind != info["kind"]:
+        node.kind = info["kind"]
+        changed = True
 
-#             except PermissionError as e:
-#                 # Ensure that we don't repeat reporting the same error whenever we refresh the tree
-#                 if not node.fs_error:
-#                     error_callback(f"No permission: {e.filename}")
-#                     node.fs_error = True
-#         # else:
-#         #     for child in node.children:
-#         #         refresh_node(tree, child, expanded_dirs, error_callback)
+    if node.is_file():
+        node.children.clear()
+        node.is_expanded = False
 
+    return changed
 
 
 def _query_entry_info(path: Path, load_details: bool) -> dict:

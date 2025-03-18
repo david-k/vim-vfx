@@ -170,7 +170,7 @@ class Session:
 
     # Whenever buf_tree or path_info is modified this function must be called to ensure that
     # base_tree can provide the necessary file/directory information.
-    def update_base_tree(self, refresh: bool = False):
+    def update_base_tree(self, refresh: bool = False) -> list[DirNode]:
         need_refresh = False
 
         if self.base_tree.has_details != self.buf_tree.has_details:
@@ -179,7 +179,7 @@ class Session:
 
         # We don't copy show_dotfiles because we always load dotfiles to keep NodeIDs stable
 
-        refresh_node(
+        return refresh_node(
             self.base_tree,
             self.base_tree.root,
             self.path_info.try_lookup(self.base_tree.root_dir()),
@@ -197,7 +197,10 @@ class Session:
 
 
     def reset_buf_tree(self):
+        self.mods = []
+        self.mods_by_id = {}
         self.buf_tree.clear()
+
         self.update_buf_tree()
 
         self.mods = compute_changes(self.base_tree, self.buf_tree)
@@ -327,12 +330,13 @@ def vim_changetick() -> int:
 
 
 def vim_set_buffer_contents(lines: list[str]):
-    line_no = vim_get_line_no()
-    column = vim_get_column_no()
-    buf = vim.current.buffer
-    buf[:] = lines
-    vim_set_line_no(line_no)
-    vim_set_column_no(column)
+    with log.scope("Update vim buffer"):
+        line_no = vim_get_line_no()
+        column = vim_get_column_no()
+        buf = vim.current.buffer
+        buf[:] = lines
+        vim_set_line_no(line_no)
+        vim_set_column_no(column)
 
 
 def vim_get_line(line_no) -> str:
@@ -764,13 +768,19 @@ def on_buf_save():
                     else:
                         move_file(buffer, new_filepath)
 
+                    # By moving the node to the correct location we ensure that when we refresh the
+                    # base tree below the node will retain its current ID (instead of getting
+                    # assigned a new one). Otherwise, the user wouldn't be able to undo the MOVE
+                    # because then the node would get its old (now invalid) ID back.
+                    s.base_tree.mv(old_filepath, new_filepath)
+
             else:
                 assert False, "Unsupported op"
-
 
         s.update_base_tree(refresh=True)
         s.reset_buf_tree()
         s.update_vim_buffer()
+
         vim.command("setl nomodified")
 
 
