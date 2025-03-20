@@ -826,6 +826,16 @@ def on_buf_unload():
     restore_alternate_buf(s)
 
 
+# For internal use only.
+def move_cursor_to_filename():
+    line = vim_get_line(vim_get_line_no())
+    if not line:
+        return 0
+
+    _, segments = parse_line(CONFIG, line)
+    vim_set_column_no(segments.name.start + 1)
+
+
 # For internal use only. Set as 'indentexpr'.
 def get_indent_for_vim(line_no: int) -> int:
     if line_no <= 1:

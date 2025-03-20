@@ -21,6 +21,7 @@ EOF
 	nnoremap <buffer> <silent> gl :py3 vfx.toggle_details()<CR>
 	nnoremap <buffer> <silent> <Tab> :py3 vfx.toggle_expand()<CR>
 	nnoremap <buffer> <silent> - :py3 vfx.quit()<CR>
+	nnoremap <buffer> <silent> ^ :py3 vfx.move_cursor_to_filename()<CR>
 
 
 	autocmd BufUnload <buffer> py3 vfx.on_buf_unload()
