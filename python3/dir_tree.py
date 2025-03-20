@@ -396,6 +396,8 @@ class DirTree:
                 line_no = parent.children[-1].line_no + 1
             elif parent.line_no is not None:
                 line_no = parent.line_no + 1
+            elif parent.is_root():
+                line_no = NUM_LINES_BEFORE_TREE + 1
 
             create_new = if_missing == "create_new"
             for (idx, name) in enumerate(path_parts):

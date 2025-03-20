@@ -219,7 +219,6 @@ def parse_buffer(config: Config, lines: list[str]) -> DirTree:
             options["show_details"],
             options["show_dotfiles"],
             lines[1:],
-            line_offset=1
         )
         tree.root.id = NodeIDKnown(options["root_id"])
         return tree
@@ -261,7 +260,6 @@ def parse_tree(
     has_details: bool,
     has_dotfiles: bool,
     lines: list[str],
-    line_offset: int
 ) -> DirTree:
     tree = DirTree(root_dir, has_details, has_dotfiles)
     tree.root.is_expanded = True
@@ -307,7 +305,7 @@ def parse_tree(
                     errors.append("Nodes are expected to have details")
 
                 node.parent = parent
-                node.line_no = line_idx + line_offset + 1
+                node.line_no = line_idx + NUM_LINES_BEFORE_TREE + 1
                 for error in errors:
                     node.add_error(error)
                 parent.children.append(node)
@@ -315,7 +313,6 @@ def parse_tree(
 
             case NewNode() as new_node:
                 node = tree.lookup_or_create_new(parent.filepath() / new_node.name, new_node.kind)
-                node.line_no = line_idx + line_offset + 1
                 for error in errors:
                     node.add_error(error)
                 prev_node = node
