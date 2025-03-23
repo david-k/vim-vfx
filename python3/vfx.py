@@ -714,7 +714,7 @@ def on_buf_save():
     apply_changes = True
     if CONFIG.confirm_changes:
         for op in operations:
-            print(op_to_str(op))
+            print(op_to_str(op, s.buf_tree.root_dir()))
 
         choice = int(vim.eval('confirm("Apply changes?", "yes\nno", 2)'))
         apply_changes = choice == 1
@@ -811,14 +811,15 @@ def buffer_changed():
         s.update_from_buf()
         # Display modifications/errors
         vim.eval('prop_clear(1, line("$"))')
+        base_dir = s.buf_tree.root_dir()
         for mod in s.mods:
             for op in mod.get_ops():
                 if op["kind"] == "delete":
-                    add_text_prop(1, op_to_str(op), align="above", style="vfx_remove")
+                    add_text_prop(1, op_to_str(op, base_dir), align="above", style="vfx_remove")
                 elif op["kind"] == "create":
-                    add_text_prop(op['node'].line_no, op_to_str(op), style="vfx_change")
+                    add_text_prop(op['node'].line_no, op_to_str(op, base_dir), style="vfx_change")
                 elif op["kind"] in ["move", "copy"]:
-                    add_text_prop(op['dest_node'].line_no, op_to_str(op), style="vfx_change")
+                    add_text_prop(op['dest_node'].line_no, op_to_str(op, base_dir), style="vfx_change")
 
         display_errors(s.buf_tree.root)
 

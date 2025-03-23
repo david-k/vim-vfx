@@ -689,18 +689,18 @@ class Modification:
 
         return ops
 
-    def print(self):
+    def print(self, base_dir: Path):
         for op in self.get_ops():
-            print(op_to_str(op))
+            print(op_to_str(op, base_dir))
 
 
-def op_to_str(op: dict) -> str:
+def op_to_str(op: dict, base_dir: Path) -> str:
     if op["kind"] == "delete":
-        return f"DELETE {op['node'].filepath_str()}"
+        return f"DELETE {op['node'].abs_filepath().relative_to(base_dir)}"
     elif op["kind"] == "create":
-        return f"CREATE {op['node'].filepath_str()}"
+        return f"CREATE {op['node'].abs_filepath().relative_to(base_dir)}"
     elif op["kind"] in ["move", "copy"]:
-        return f"{op['kind'].upper()} {op['src_node'].filepath_str()} -> {op['dest_node'].filepath_str()}"
+        return f"{op['kind'].upper()} {op['src_node'].abs_filepath().relative_to(base_dir)} -> {op['dest_node'].abs_filepath().relative_to(base_dir)}"
 
     assert False
 
@@ -1070,7 +1070,7 @@ def sort_operations(ops: list[dict]) -> list[dict]:
         sorted_ops: list[dict] = []
         for op_idx in topological_sort(list(range(len(ops))), deps):
             sorted_ops.append(ops[op_idx])
-            log.debug(f"{op_to_str(ops[op_idx])} {deps.get(op_idx, [])})")
+            log.debug(f"{op_to_str(ops[op_idx], Path('/'))} {deps.get(op_idx, [])})")
 
     return sorted_ops
 
