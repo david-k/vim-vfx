@@ -197,7 +197,7 @@ def node_sort_key(node: DirNode) -> tuple[bool, str]:
 
 
 def next_id_default(tree: "DirTree", node_abs_path: Path) -> NodeIDKnown:
-    return  tree.next_node_id()
+    return tree.next_node_id()
 
 
 # While there are pending modifications, the NodeID for a file in the filesystem must never change.
@@ -315,6 +315,19 @@ class DirTree:
                 self.lookup(dest.parent).insert_child(src_node)
 
 
+    def cp(self, src: Path, dest: Path):
+        dest_parent_node = self.lookup(dest.parent)
+        src_copy = self._copy_node(self.lookup(src), dest_parent_node)
+        dest_parent_node.insert_child(src_copy)
+        src_copy.name = dest.name
+
+
+    def rm(self, path: Path):
+        node = self.lookup(path)
+        if node.parent:
+            node.parent.remove_child_by_id(node.id)
+
+
     def is_expanded_at(self, p: Path) -> bool:
         node = self.try_lookup(p)
         if node is None:
@@ -415,6 +428,15 @@ class DirTree:
             return parent
 
         return None
+
+
+    def _copy_node(self, node: DirNode, new_parent: DirNode) -> DirNode:
+        new_node = node.copy_without_children(new_parent)
+        new_node.id = self.next_node_id()
+        for child in node.children:
+            new_node.children.append(self._copy_node(child, new_node))
+
+        return new_node
 
 
     def _make_relative(self, p: Path) -> Path:
@@ -578,7 +600,7 @@ def get_expanded_dirs_for_node(node: DirNode) -> PathInfoNode:
 #     return expanded_dirs
 
 
-def get_nodes_by_id(tree: DirTree) -> tuple[dict[NodeIDKnown, list[DirNode]], list[DirNode]]:
+def get_all_nodes_by_id(tree: DirTree) -> tuple[dict[NodeIDKnown, list[DirNode]], list[DirNode]]:
     def get_nodes_by_id_rec(
             node: DirNode,
             nodes_by_id: dict[NodeIDKnown, list[DirNode]],
@@ -591,7 +613,9 @@ def get_nodes_by_id(tree: DirTree) -> tuple[dict[NodeIDKnown, list[DirNode]], li
                 if not node.is_root():
                     nodes_by_id.setdefault(node.id, []).append(node)
 
-        if node.is_dir() and node.is_expanded:
+        # Traverse children irrespective of node.is_expanded. This is because when editing the
+        # buffer, you may add files to a directory without expanding the directory beforehand.
+        if node.is_dir():
             for child in node.children:
                 get_nodes_by_id_rec(child, nodes_by_id, new_nodes)
 
@@ -804,7 +828,7 @@ def _update_buf_node_from_base(
 def compute_changes(base_tree: DirTree, buf_tree: DirTree) -> list[Modification]:
     base_root = base_tree.lookup(buf_tree.root_dir())
 
-    buf_nodes_by_id, new_nodes = get_nodes_by_id(buf_tree)
+    buf_nodes_by_id, new_nodes = get_all_nodes_by_id(buf_tree)
     visible_base_nodes_by_id = get_nodes_in_expanded_dirs(
         base_root,
         get_expanded_dirs_for_node(buf_tree.root),

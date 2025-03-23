@@ -734,9 +734,12 @@ def on_buf_save():
                 else:
                     filepath.mkdir()
 
+                s.base_tree.lookup_or_create_existing(filepath, op["node"].kind)
+
             elif op["kind"] == "delete":
                 filepath = op["node"].abs_filepath()
                 subprocess.run(["trash", "--", filepath])
+                s.base_tree.rm(filepath)
 
             elif op["kind"] == "copy":
                 old_filepath = op["src_node"].abs_filepath()
@@ -750,6 +753,11 @@ def on_buf_save():
                         shutil.copyfile(old_filepath, new_filepath, follow_symlinks=False)
                     else:
                         shutil.copytree(old_filepath, new_filepath, symlinks=True)
+
+                # In contrast to MOVE operations, updating the base_tree for COPY operations itself
+                # is not necessary if the refresh the base tree. However, in order to be able to
+                # MOVE files to a COPIED directory, we still need to udpate the base_tree.
+                s.base_tree.cp(old_filepath, new_filepath)
 
             elif op["kind"] == "move":
                 old_filepath = op["src_node"].abs_filepath()
