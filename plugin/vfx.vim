@@ -22,6 +22,8 @@ EOF
 	nnoremap <buffer> <silent> <Tab> :py3 vfx.toggle_expand()<CR>
 	nnoremap <buffer> <silent> - :py3 vfx.quit()<CR>
 	nnoremap <buffer> <silent> ^ :py3 vfx.move_cursor_to_filename()<CR>
+	nnoremap <buffer> <silent> yp :py3 vfx.yank_absolute_path()<CR>
+	nnoremap <buffer> <silent> yP :py3 vfx.yank_absolute_path(use_system_clipboard=True)<CR>
 
 
 	autocmd BufUnload <buffer> py3 vfx.on_buf_unload()

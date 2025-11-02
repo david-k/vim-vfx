@@ -701,6 +701,20 @@ def toggle_details():
     s.update_vim_buffer()
 
 
+def yank_absolute_path(use_system_clipboard: bool = False):
+    s = get_session(); assert s
+    s.update_from_buf()
+
+    node = s.buf_tree.try_lookup(get_path_at(vim_get_line_no()))
+    if use_system_clipboard:
+        target_register = "+"
+    else:
+        target_register = vim.eval("v:register")
+
+    vim.eval(f"setreg({escape_for_vim_expr(target_register)}, {escape_for_vim_expr(str(node.abs_filepath()))})")
+    print(f"Copied {node.abs_filepath()}")
+
+
 # For internal use only. Called when the BufWriteCmd autocmd event is fired.
 def on_buf_save():
     s = get_session(); assert s
