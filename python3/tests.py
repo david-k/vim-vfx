@@ -19,6 +19,9 @@ TEST_SCENARIOS_DIR = (SCRIPT_DIR / "../test-scenarios").resolve()
 TEST_REALM_DIR = (SCRIPT_DIR / "../test-realm").resolve()
 
 
+# "Testing Without Mocks: A Pattern Language": https://www.jamesshore.com/v2/projects/nullables/testing-without-mocks
+
+
 # Utils
 #===============================================================================
 def equiv_nodes(a: DirNode, b: DirNode) -> bool:
@@ -49,11 +52,11 @@ def equiv_trees(a: DirTree, b: DirTree) -> bool:
     return equiv_nodes(a.root, b.root)
 
 
-def equiv_mods(actual_mods: list[Modification], expected_mod_strings: list[str]) -> bool:
+def equiv_mods(actual_mods: list[Modification], expected_mod_strings: list[str], base_dir: Path) -> bool:
     actual_mods_set = set()
     for mod in actual_mods:
         for op in mod.get_ops():
-            actual_mods_set.add(op_to_str(op))
+            actual_mods_set.add(op_to_str(op, base_dir))
 
     expected_mods_set = set(expected_mod_strings)
     return actual_mods_set == expected_mods_set
@@ -152,9 +155,13 @@ class TestSession:
         return s
 
 
+    def base_dir(self) -> Path:
+        return self.base_tree.root_dir()
+
+
     def print_mods(self):
         for mod in self.modifications:
-            mod.print()
+            mod.print(self.base_dir())
 
 
     # Editor commands
@@ -305,7 +312,7 @@ f"""
 |2_ foo
 """
 )
-    assert equiv_mods(s.modifications, ["MOVE baz/subfile -> subfile"])
+    assert equiv_mods(s.modifications, ["MOVE baz/subfile -> subfile"], s.base_dir())
 
     s.set_expanded("baz", False)
     assert equiv_trees(s.buf_tree, mk_tree(
@@ -316,10 +323,10 @@ f"""
 |2_ foo
 """
 ))
-    assert equiv_mods(s.modifications, ["MOVE baz/subfile -> subfile"])
+    assert equiv_mods(s.modifications, ["MOVE baz/subfile -> subfile"], s.base_dir())
 
     s.set_expanded("baz", True)
-    assert equiv_mods(s.modifications, ["MOVE baz/subfile -> subfile"])
+    assert equiv_mods(s.modifications, ["MOVE baz/subfile -> subfile"], s.base_dir())
     assert equiv_trees(s.buf_tree, mk_tree(
 f"""
 > root_id=0 show_details=False show_dotfiles=False | {test_dir}
@@ -361,7 +368,7 @@ dubi/du
     assert equiv_mods(s.modifications, [
         "CREATE dubi/",
         "CREATE dubi/du",
-    ])
+    ], s.base_dir())
 
 
     s.update_buffer(
@@ -386,7 +393,7 @@ f"""
         "CREATE hi/hi/ho",
         "CREATE haha/",
         "CREATE haha/hihi/",
-    ])
+    ], s.base_dir())
 
 
 def test_cd_down():
@@ -537,6 +544,37 @@ f"""
     s.set_expanded("baz", True)
 
 
+def test_new_node_after_expanded_dir():
+    # Prepare test directory
+    test_dir = TEST_REALM_DIR / inspect.getframeinfo(unwrap(inspect.currentframe())).function
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+    scenario1 = (
+f"""
+> root_id=0 show_details=True show_dotfiles=False | {test_dir}
+[drwxr-xr-x david david 4.0K 2025-11-02 12:41] -1_ baz/
+[-rw-r--r-- david david  0.0 2025-11-02 12:41]     |3_ ciao
+[-rw-r--r-- david david  0.0 2025-11-02 12:41] |2_ bar
+"""
+)
+    s = TestSession.init_fs(mk_tree(scenario1), init_dir="./")
+    s.set_expanded("baz", True)
+
+    scenario2 = (
+f"""
+> root_id=0 show_details=True show_dotfiles=False | {test_dir}
+[drwxr-xr-x david david 4.0K 2025-11-02 12:41] -1_ baz/
+[-rw-r--r-- david david  0.0 2025-11-02 12:41]     |3_ ciao
+                                                 new_dir/
+[-rw-r--r-- david david  0.0 2025-11-02 12:41] |2_ bar
+"""
+)
+    s.update_buffer(scenario2)
+    assert equiv_mods(s.modifications, [
+        "CREATE new_dir/",
+    ], s.base_dir())
+
+
 def test_parsing():
     scenario1 = (
 f"""
@@ -627,6 +665,32 @@ f"""
     visit_nodes(s.buf_tree.root, node_has_details)
 
 
+def test_renaming_after_cd():
+    # Prepare test directory
+    test_dir = TEST_REALM_DIR / inspect.getframeinfo(unwrap(inspect.currentframe())).function
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+    scenario = (
+f"""
+> root_id=0 show_details=False show_dotfiles=False | {test_dir}
+-1_ baz/
+    -4_ sub/
+        |7_ subfile
+    |5_ ciao
+    |6_ hello
+|2_ bar
+|3_ foo
+"""
+)
+    s = TestSession.init_fs(mk_tree(scenario), init_dir="./")
+    s.set_expanded("baz", True)
+
+    s.base_tree.print()
+    print("---")
+    s.base_tree.mv(Path("baz/ciao"), Path("cccc"))
+    s.base_tree.print()
+
+
 # Main
 #===============================================================================
 TEST_REALM_DIR.mkdir(exist_ok=True)
@@ -639,6 +703,8 @@ test_cd_down_two_levels()
 test_cd_up()
 test_up_twice()
 test_up_up_expand()
+test_new_node_after_expanded_dir()
 test_parsing()
 test_expand_cd_sub()
 test_toggle_details()
+#test_renaming_after_cd()

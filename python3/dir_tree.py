@@ -113,8 +113,12 @@ class DirNode:
 
         return Path()
 
-    def filepath_str(self) -> str:
-        filepath = str(self.filepath())
+    def filepath_str(self, relative_to: Path|None = None) -> str:
+        if relative_to is not None:
+            filepath = str(self.abs_filepath().relative_to(relative_to))
+        else:
+            filepath = str(self.filepath())
+
         return filepath + "/" if self.is_dir() else filepath
 
     def abs_filepath(self) -> Path:
@@ -696,11 +700,11 @@ class Modification:
 
 def op_to_str(op: dict, base_dir: Path) -> str:
     if op["kind"] == "delete":
-        return f"DELETE {op['node'].abs_filepath().relative_to(base_dir)}"
+        return f"DELETE {op['node'].filepath_str(relative_to=base_dir)}"
     elif op["kind"] == "create":
-        return f"CREATE {op['node'].abs_filepath().relative_to(base_dir)}"
+        return f"CREATE {op['node'].filepath_str(relative_to=base_dir)}"
     elif op["kind"] in ["move", "copy"]:
-        return f"{op['kind'].upper()} {op['src_node'].abs_filepath().relative_to(base_dir)} -> {op['dest_node'].abs_filepath().relative_to(base_dir)}"
+        return f"{op['kind'].upper()} {op['src_node'].filepath_str(relative_to=base_dir)} -> {op['dest_node'].filepath_str(relative_to=base_dir)}"
 
     assert False
 

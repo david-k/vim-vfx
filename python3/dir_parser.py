@@ -282,13 +282,14 @@ def parse_tree(
             if prev_offset.base_offset is None and offset.base_offset is not None:
                 prev_offset.rebase(offset.base_offset)
 
-            relative_indent = int(offset.diff(prev_offset) / config.indent_width)
+            relative_change = offset.diff(prev_offset)
+            relative_indent = int(relative_change / config.indent_width)
 
             # Update parent stack if indention has changed
             if relative_indent < 0:
                 for i in range(-relative_indent):
                     parent_stack.pop()
-                prev_offset.entry_offset = offset.entry_offset
+                prev_offset.entry_offset += relative_change
             elif relative_indent > 0:
                 if not prev_node:
                     errors.append("First line cannot be indented")
@@ -313,6 +314,7 @@ def parse_tree(
 
             case NewNode() as new_node:
                 node = tree.lookup_or_create_new(parent.filepath() / new_node.name, new_node.kind)
+                node.line_no = line_idx + NUM_LINES_BEFORE_TREE + 1
                 for error in errors:
                     node.add_error(error)
                 prev_node = node
